@@ -6,7 +6,9 @@
 + 🖼️ Photo: custom image upload or auto-generated image
 + 🎨 Auto Image: message text -> stylish image (same font, emoji rendered properly)
 + ⏰ Two time modes: One-Time schedule OR 🔁 Loop Mode (repeat every X minutes)
-+ All previous features: accounts/sessions, GCs, time, status, start/stop
++ 🌐 NEW: "Promo in ALL GCs" — sends to every group/channel the account is a member of
++ 🔐 NEW: per-user private data (nobody sees another user's accounts/groups)
++ 🔑 NEW: session.txt is given to the user after login (usable anywhere)
 
 Install: pip install pyrogram tgcrypto pillow pilmoji requests python-dotenv
 Font:    put any .ttf (Poppins/Montserrat) in the bot folder,
@@ -14,6 +16,8 @@ Font:    put any .ttf (Poppins/Montserrat) in the bot folder,
 """
 
 import asyncio
+import glob
+import io
 import json
 import os
 from dotenv import load_dotenv
@@ -60,6 +64,13 @@ DATA_FILE = "data.json"
 DELAY_BETWEEN_MSGS = 3
 DELAY_BETWEEN_ACCOUNTS = 10
 
+# Chat types allowed in "Promo in ALL GCs" (works on both Pyrogram v1 & v2)
+try:
+    from pyrogram.enums import ChatType
+    _CHAT_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL)
+except Exception:
+    _CHAT_TYPES = ("group", "supergroup", "channel")
+
 bot = Client("promo_manager", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 user_state = {}
@@ -75,17 +86,23 @@ async def safe_stop(client):
     except Exception:
         pass
 
-# ===================== DATA STORE =====================
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
+# ===================== DATA STORE (PER-USER) =====================
+def data_path(uid=None):
+    """Each user gets their own file → nobody sees anyone else's data."""
+    return DATA_FILE if uid is None else f"data_{uid}.json"
+
+def load_data(uid=None):
+    path = data_path(uid)
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     return {"accounts": [], "groups": [], "message": "",
             "time": "", "running": False, "photo": "", "auto_image": True,
             "mode": "once", "interval": 0}
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
+def save_data(uid, data):
+    path = data_path(uid)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 # ===================== IMAGE GENERATION =====================
@@ -178,6 +195,7 @@ def main_kb():
         [InlineKeyboardButton("⏰ Set Time", callback_data="set_time"),
          InlineKeyboardButton("📊 Current Promo", callback_data="status")],
         [InlineKeyboardButton("🚀 START PROMO", callback_data="start_promo")],
+        [InlineKeyboardButton("🌐 Promo in ALL GCs (auto)", callback_data="promo_all")],
     ])
 
 def back_kb():
@@ -280,7 +298,8 @@ def build_status(d):
 
 # ===================== GROUP LOGIC =====================
 async def add_group_entry(entry, message):
-    d = load_data()
+    uid = message.chat.id
+    d = load_data(uid)
     if entry["type"] == "invite":
         link = f"https://t.me/+{entry['value']}"
         for acc in d["accounts"]:
@@ -304,7 +323,7 @@ async def add_group_entry(entry, message):
             except Exception:
                 pass
     d["groups"].append(entry)
-    save_data(d)
+    save_data(uid, d)
 
 async def resolve_chat_id(user, entry, acc_name):
     """Resolves the group chat ID (joins via username/invite if needed)."""
@@ -435,9 +454,171 @@ async def send_to_group(user, entry, acc_name, d, stop_event):
         res = await send_payload(user, chat_id, d, stop_event, force_text=force_text)
         return "✅" if res == "✅" else f"❌ {res}"
 
+# ===================== PROMO IN ALL GCS (NEW) =====================
+async def discover_member_groups(user, d, acc_name):
+    """
+    Finds every group/channel where this account is a member,
+    skipping the GCs already present in the user's saved list.
+    """
+    covered = set()
+    for g in d.get("groups", []):
+        if g["type"] == "id":
+            covered.add(int(g["value"]))
+        elif g["type"] == "invite":
+            cid = g.get("ids", {}).get(acc_name)
+            if cid:
+                covered.add(cid)
+        elif g["type"] == "username":
+            try:
+                await user.join_chat(g["value"])
+            except Exception:
+                pass
+            try:
+                covered.add((await user.get_chat(g["value"])).id)
+            except Exception:
+                pass
+
+    targets = []
+    try:
+        # raise the limit (500) if the account is in more chats
+        async for dialog in user.get_dialogs(limit=500):
+            c = dialog.chat
+            if c.type not in _CHAT_TYPES:
+                continue
+            if c.id in covered:
+                continue
+            targets.append(c)
+    except Exception:
+        pass
+    return targets
+
+async def run_promo_all(chat_id, progress_msg_id):
+    d = load_data(chat_id)
+    accounts = d["accounts"]
+    time_str = d["time"]
+    mode = d.get("mode", "once")
+    interval = int(d.get("interval", 0) or 0)
+
+    ev = asyncio.Event()
+    promo_state[chat_id] = ev
+    d["running"] = True
+    save_data(chat_id, d)
+
+    results = []
+    try:
+        if mode == "loop":
+            wait_until = datetime.now()
+            await bot.edit_message_text(
+                chat_id, progress_msg_id,
+                f"🔁 **PROMO TO ALL GCS (LOOP MODE)**\n\n"
+                f"📱 Accounts: {len(accounts)}\n"
+                f"⏱ Interval: every {interval} min\n"
+                f"🌐 Every group/channel where the accounts are members will get the promo.\n"
+                f"GCs already in your list are skipped.\n\n"
+                f"Tap 🛑 to stop.",
+                reply_markup=stop_kb(),
+            )
+        else:
+            wait_until = compute_target(time_str)
+            await bot.edit_message_text(
+                chat_id, progress_msg_id,
+                f"⏳ **PROMO TO ALL GCS SCHEDULED**\n\n"
+                f"📱 Accounts: {len(accounts)}\n"
+                f"⏰ Time: {time_str} ({wait_until.strftime('%H:%M:%S')})\n\n"
+                f"Tap 🛑 to stop.",
+                reply_markup=stop_kb(),
+            )
+
+        run_number = 0
+        while True:
+            # ---- wait until the run time (loop mode waits between runs) ----
+            delta = (wait_until - datetime.now()).total_seconds()
+            if delta > 0:
+                await asyncio.sleep(delta)
+            if ev.is_set():
+                break
+
+            run_number += 1
+            results = []
+            for i, acc in enumerate(accounts, 1):
+                if ev.is_set():
+                    results.append(f"🛑 {acc['name']}: stopped")
+                    break
+                await bot.edit_message_text(
+                    chat_id, progress_msg_id,
+                    f"🌐 **Run #{run_number}** — {acc['name']} → discovering GCs... ({i}/{len(accounts)})",
+                    reply_markup=stop_kb(),
+                )
+                ok = fail = 0
+                try:
+                    async with Client(f"pa_{chat_id}_{i}", API_ID, API_HASH,
+                                      session_string=acc["session"], in_memory=True) as user:
+                        targets = await discover_member_groups(user, d, acc["name"])
+                        await bot.edit_message_text(
+                            chat_id, progress_msg_id,
+                            f"🌐 **Run #{run_number}** — {acc['name']} → {len(targets)} new GCs, sending... ({i}/{len(accounts)})",
+                            reply_markup=stop_kb(),
+                        )
+                        for c in targets:
+                            if ev.is_set():
+                                break
+                            try:
+                                res = await send_payload(user, c.id, d, ev, force_text=False)
+                                if res == "✅":
+                                    ok += 1
+                                else:
+                                    fail += 1
+                                    results.append(f"❌ {acc['name']} → {c.title or c.id}: {res}")
+                            except Exception as e:
+                                fail += 1
+                                results.append(f"❌ {acc['name']} → {c.title or c.id}: {e}")
+                except Exception as e:
+                    fail += 1
+                    results.append(f"❌ {acc['name']}: {e}")
+                if ok == 0 and fail == 0:
+                    results.append(f"ℹ️ {acc['name']}: no new GCs found (all are already in your list)")
+                results.append(f"{'✅' if fail == 0 else '⚠️'} {acc['name']}: {ok} ok / {fail} fail")
+                await asyncio.sleep(DELAY_BETWEEN_ACCOUNTS)
+
+            # ---- what happens after this run ----
+            if mode == "loop" and not ev.is_set():
+                next_run = datetime.now() + timedelta(minutes=interval)
+                await bot.edit_message_text(
+                    chat_id, progress_msg_id,
+                    f"🔁 **RUN #{run_number} DONE** ✅\n\n" + "\n".join(results) +
+                    f"\n\n⏱ Next run: **{next_run.strftime('%H:%M:%S')}** (every {interval} min)\n"
+                    f"Tap 🛑 to stop the loop.",
+                    reply_markup=stop_kb(),
+                )
+                # sleep in small chunks so the STOP button responds fast
+                while datetime.now() < next_run:
+                    if ev.is_set():
+                        break
+                    await asyncio.sleep(5)
+            else:
+                # one-time mode: finished
+                await bot.edit_message_text(
+                    chat_id, progress_msg_id,
+                    f"🏁 **PROMO TO ALL GCS DONE**\n\n" + "\n".join(results),
+                    reply_markup=main_kb(),
+                )
+                break
+
+        # stopped mid-run (during wait or sending)
+        if ev.is_set():
+            txt = "🛑 **PROMO STOPPED**"
+            if results:
+                txt += "\n\n" + "\n".join(results)
+            await bot.edit_message_text(chat_id, progress_msg_id, txt, reply_markup=main_kb())
+    finally:
+        d = load_data(chat_id)
+        d["running"] = False
+        save_data(chat_id, d)
+        promo_state.pop(chat_id, None)
+
 # ===================== PROMO RUNNER =====================
 async def run_promo(chat_id, progress_msg_id):
-    d = load_data()
+    d = load_data(chat_id)
     accounts, groups = d["accounts"], d["groups"]
     time_str = d["time"]
     mode = d.get("mode", "once")
@@ -446,7 +627,7 @@ async def run_promo(chat_id, progress_msg_id):
     ev = asyncio.Event()
     promo_state[chat_id] = ev
     d["running"] = True
-    save_data(d)
+    save_data(chat_id, d)
 
     results = []
     try:
@@ -543,9 +724,9 @@ async def run_promo(chat_id, progress_msg_id):
                 txt += "\n\n" + "\n".join(results)
             await bot.edit_message_text(chat_id, progress_msg_id, txt, reply_markup=main_kb())
     finally:
-        d = load_data()
+        d = load_data(chat_id)
         d["running"] = False
-        save_data(d)
+        save_data(chat_id, d)
         promo_state.pop(chat_id, None)
 
 # ===================== COMMANDS =====================
@@ -568,7 +749,8 @@ async def help_cmd(client, message: Message):
 • Tap ➕ Add Account
 • Send your phone number in international format — `+919876543210`
 • Send the OTP you receive (enter the 2FA password if enabled)
-• Session saved ✅ — add as many accounts as you want
+• Session saved ✅ — you also receive your **session.txt** file
+  (use that session in any other Pyrogram tool)
 • To remove one, tap 👥 My Accounts → ❌
 
 **2️⃣ ADD GROUPS (GC)**
@@ -595,8 +777,14 @@ async def help_cmd(client, message: Message):
    — promo runs NOW, then repeats every X minutes until you tap 🛑
 
 **6️⃣ START**
-• Tap 🚀 START PROMO — sends photo + message to all groups from all accounts 🚀
+• Tap 🚀 **START PROMO** — sends photo + message to your saved GC list 🚀
+• Tap 🌐 **Promo in ALL GCs** — automatically finds EVERY group/channel
+  where your accounts are members and sends there too
+  (GCs already in your list are skipped, no duplicates)
 • Tap 🛑 STOP PROMO to stop mid-run (also stops the loop)
+
+**🔐 PRIVACY**
+• Your data is stored per-user — nobody else can see your accounts, groups or sessions
 
 **⚠️ NOTE:** Sending too fast may get your Telegram account **banned**.
 Delays are set (3s msgs / 10s accounts) — change them at the top of the code.
@@ -610,12 +798,27 @@ async def cancel_cmd(client, message: Message):
     await safe_stop(st.get("temp") if st else None)
     await message.reply_text("❌ Cancelled. Back to main menu:", reply_markup=main_kb())
 
+# ===================== SESSION FILE (NEW) =====================
+async def send_session_file(message, phone, session):
+    """Sends the session string as a .txt file so the user can reuse it anywhere."""
+    try:
+        bio = io.BytesIO(session.encode("utf-8"))
+        bio.name = f"session_{phone.replace('+', '')}.txt"
+        await message.reply_document(
+            bio,
+            caption="🔑 **Your session string** — save it carefully!\n\n"
+                    "⚠️ Anyone who has this string can fully control this account.\n"
+                    "✅ You can also use this session in any other Pyrogram tool.",
+        )
+    except Exception:
+        pass
+
 # ===================== CALLBACKS =====================
 @bot.on_callback_query()
 async def on_cb(client, cb: CallbackQuery):
     data = cb.data
     chat_id = cb.message.chat.id
-    d = load_data()
+    d = load_data(chat_id)
 
     if data == "add_acc":
         user_state[chat_id] = {"step": "phone"}
@@ -638,7 +841,7 @@ async def on_cb(client, cb: CallbackQuery):
     if data.startswith("rm_acc:"):
         idx = int(data.split(":")[1])
         removed = d["accounts"].pop(idx)
-        save_data(d)
+        save_data(chat_id, d)
         await cb.answer(f"✅ {removed['name']} removed", show_alert=True)
         if d["accounts"]:
             await cb.message.edit_text("👥 **MY ACCOUNTS**", reply_markup=accs_kb(d))
@@ -667,7 +870,7 @@ async def on_cb(client, cb: CallbackQuery):
     if data.startswith("rm_gc:"):
         idx = int(data.split(":")[1])
         d["groups"].pop(idx)
-        save_data(d)
+        save_data(chat_id, d)
         await cb.answer("✅ Group removed", show_alert=True)
         if d["groups"]:
             await cb.message.edit_text("📋 **MY GROUPS**", reply_markup=groups_kb(d))
@@ -705,7 +908,7 @@ async def on_cb(client, cb: CallbackQuery):
 
     if data == "photo_rm":
         d["photo"] = ""
-        save_data(d)
+        save_data(chat_id, d)
         await cb.answer("❌ Photo removed", show_alert=True)
         await cb.message.edit_text("🖼️ **PROMO PHOTO** — photo removed. Auto-generate is active again.",
                                    reply_markup=photo_kb(d))
@@ -758,8 +961,34 @@ async def on_cb(client, cb: CallbackQuery):
             await cb.answer(f"❌ Set these first: {', '.join(missing)}", show_alert=True); return
         if promo_state.get(chat_id):
             await cb.answer("⏳ Promo already running!", show_alert=True); return
+        if d.get("running"):
+            d["running"] = False   # stale flag after a restart
+            save_data(chat_id, d)
         msg = await cb.message.edit_text("🚀 **PROMO IS STARTING...**")
         asyncio.create_task(run_promo(chat_id, msg.id))
+        await cb.answer(); return
+
+    if data == "promo_all":
+        # "Promo in ALL GCs" — no saved GC list needed, groups are auto-discovered
+        missing = []
+        if not d["accounts"]: missing.append("accounts")
+        if not d["message"]: missing.append("message")
+        mode = d.get("mode", "once")
+        if mode == "loop":
+            if not d.get("interval"):
+                missing.append("loop interval (⏰ Set Time → 🔁 Loop Mode)")
+        else:
+            if not d["time"]:
+                missing.append("time (⏰ Set Time → 🕐 One-Time)")
+        if missing:
+            await cb.answer(f"❌ Set these first: {', '.join(missing)}", show_alert=True); return
+        if promo_state.get(chat_id):
+            await cb.answer("⏳ Promo already running!", show_alert=True); return
+        if d.get("running"):
+            d["running"] = False   # stale flag after a restart
+            save_data(chat_id, d)
+        msg = await cb.message.edit_text("🌐 **PROMO TO ALL GCS IS STARTING...**")
+        asyncio.create_task(run_promo_all(chat_id, msg.id))
         await cb.answer(); return
 
     if data == "stop_promo":
@@ -859,21 +1088,26 @@ async def handle_text(client, message: Message):
             return
 
         # ---- SAVE FIRST, stop after (so the session can never get lost) ----
-        d = load_data()
+        d = load_data(chat_id)
         if any(a["name"] == st["phone"] for a in d["accounts"]):
             user_state.pop(chat_id, None)
             await safe_stop(temp)
+            await send_session_file(message, st["phone"], session)
             await message.reply_text(
-                f"⚠️ **{st['phone']}** is already added.", reply_markup=main_kb()
+                f"⚠️ **{st['phone']}** is already added.\n\n"
+                f"🔑 Your session file has been sent again above.",
+                reply_markup=main_kb()
             )
             return
         d["accounts"].append({"name": st["phone"], "session": session,
                               "added": datetime.now().isoformat()})
-        save_data(d)
+        save_data(chat_id, d)
         user_state.pop(chat_id, None)
         await safe_stop(temp)
+        await send_session_file(message, st["phone"], session)
         await message.reply_text(
             f"✅ **Account added!**\n\n📱 {st['phone']}\nTotal: {len(d['accounts'])} accounts\n\n"
+            f"🔑 Your **session.txt** was sent above — you can reuse it anywhere.\n\n"
             f"Add more via ➕ Add Account, or continue with ➕ Add Group.",
             reply_markup=main_kb()
         )
@@ -907,21 +1141,26 @@ async def handle_text(client, message: Message):
             return
 
         # ---- SAVE FIRST, stop after ----
-        d = load_data()
+        d = load_data(chat_id)
         if any(a["name"] == st["phone"] for a in d["accounts"]):
             user_state.pop(chat_id, None)
             await safe_stop(temp)
+            await send_session_file(message, st["phone"], session)
             await message.reply_text(
-                f"⚠️ **{st['phone']}** is already added.", reply_markup=main_kb()
+                f"⚠️ **{st['phone']}** is already added.\n\n"
+                f"🔑 Your session file has been sent again above.",
+                reply_markup=main_kb()
             )
             return
         d["accounts"].append({"name": st["phone"], "session": session,
                               "added": datetime.now().isoformat()})
-        save_data(d)
+        save_data(chat_id, d)
         user_state.pop(chat_id, None)
         await safe_stop(temp)
+        await send_session_file(message, st["phone"], session)
         await message.reply_text(
             f"✅ **Account added!**\n\n📱 {st['phone']}\nTotal: {len(d['accounts'])} accounts\n\n"
+            f"🔑 Your **session.txt** was sent above — you can reuse it anywhere.\n\n"
             f"Add more via ➕ Add Account, or continue with ➕ Add Group.",
             reply_markup=main_kb()
         )
@@ -934,16 +1173,16 @@ async def handle_text(client, message: Message):
         user_state.pop(chat_id, None)
         await message.reply_text("⏳ Adding group (accounts are joining via invite link)...")
         await add_group_entry(entry, message)
-        d = load_data()
+        d = load_data(chat_id)
         await message.reply_text(
             f"✅ **Group added!**\n\n{entry['raw']}\nTotal groups: {len(d['groups'])}",
             reply_markup=main_kb()
         )
 
     elif st["step"] == "msg":
-        d = load_data()
+        d = load_data(chat_id)
         d["message"] = message.text
-        save_data(d)
+        save_data(chat_id, d)
         user_state.pop(chat_id, None)
         preview = message.text[:80] + ("..." if len(message.text) > 80 else "")
         await message.reply_text(
@@ -963,10 +1202,10 @@ async def handle_text(client, message: Message):
             except ValueError:
                 await message.reply_text("❌ Invalid interval. Send a number of **minutes**, e.g. `30`.")
                 return
-            d = load_data()
+            d = load_data(chat_id)
             d["mode"] = "loop"
             d["interval"] = interval
-            save_data(d)
+            save_data(chat_id, d)
             user_state.pop(chat_id, None)
             await message.reply_text(
                 f"✅ **Loop Mode set!** 🔁\n\n"
@@ -981,10 +1220,10 @@ async def handle_text(client, message: Message):
             except Exception:
                 await message.reply_text("❌ Invalid format. Send `5` (minutes) or `14:30` (time).")
                 return
-            d = load_data()
+            d = load_data(chat_id)
             d["mode"] = "once"
             d["time"] = t
-            save_data(d)
+            save_data(chat_id, d)
             user_state.pop(chat_id, None)
             await message.reply_text(f"✅ Time set: **{t}** (one-time)", reply_markup=main_kb())
 
@@ -1001,10 +1240,10 @@ async def handle_photo(client, message: Message):
     if not path:
         await message.reply_text("❌ Download failed. Try again.")
         return
-    d = load_data()
+    d = load_data(chat_id)
     d["photo"] = path
     d["auto_image"] = False
-    save_data(d)
+    save_data(chat_id, d)
     user_state.pop(chat_id, None)
     await message.reply_text(
         "🖼️ **Photo set!** ✅\n\n"
@@ -1015,9 +1254,16 @@ async def handle_photo(client, message: Message):
 
 # ===================== MAIN =====================
 if __name__ == "__main__":
-    d = load_data()
-    if d.get("running"):
-        d["running"] = False   # reset stale flag after a restart
-        save_data(d)
+    # reset stale "running" flags across all user files after a restart
+    for path in glob.glob("data*.json"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                dd = json.load(f)
+            if dd.get("running"):
+                dd["running"] = False
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(dd, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
     print("🤖 Promo Bot v2 starting...")
     bot.run()
