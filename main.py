@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-🤖 TELEGRAM PROMO BOT v2
+🤖 TELEGRAM PROMO BOT v2.1
 ------------------------
 + Full English quote support (never truncated)
 + 🖼️ Photo: custom image upload or auto-generated image
 + 🎨 Auto Image: message text -> stylish image (same font, emoji rendered properly)
 + ⏰ Two time modes: One-Time schedule OR 🔁 Loop Mode (repeat every X minutes)
-+ 🌐 NEW: "Promo in ALL GCs" — sends to every group/channel the account is a member of
-+ 🔐 NEW: per-user private data (nobody sees another user's accounts/groups)
-+ 🔑 NEW: session.txt is given to the user after login (usable anywhere)
-+ 🛑 FIX: STOP PROMO → message becomes "PROMO STOPPED" with RESTART + Menu buttons
-+ 🔇 FIX: "Peer id invalid" console spam is silenced (cosmetic noise only)
++ 🎯 NEW: Promo Target — 💬 DM only / 📋 GC only / 💬+📋 DM + GC
++ 💬 NEW: DM promo — sends to EVERY private chat the account has a conversation with
++ 🌐 AUTO promo — all member GCs + all DMs (respects the chosen target)
++ 🔐 per-user private data (nobody sees another user's accounts/groups)
++ 🔑 session.txt is given to the user after login (usable anywhere)
++ 🔊 LOUD errors — no silent monkey-patching; all Pyrogram noise/errors visible
 
 Install: pip install pyrogram tgcrypto pillow pilmoji requests python-dotenv
 Font:    put any .ttf (Poppins/Montserrat) in the bot folder,
@@ -33,57 +34,6 @@ from pyrogram.errors import (FloodWait, PasswordHashInvalid, PhoneCodeExpired,
                              UserAlreadyParticipant)
 from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
                             InlineKeyboardMarkup, Message)
-
-# ===================== PYROGRAM COMPAT SHIM =====================
-# Silences the cosmetic "Peer id invalid" tracebacks that Pyrogram's
-# update loop prints for chats not yet in its local storage.
-# 1) quieter pyrogram logs
-# 2) get_peer_type never raises for unknown peers
-# 3) handle_updates drops unresolvable-peer updates silently
-# 4) asyncio loop handler swallows leftover task noise
-import logging as _logging
-_logging.getLogger("pyrogram").setLevel(_logging.ERROR)
-
-import pyrogram.utils as _pyro_utils
-
-_orig_get_peer_type = getattr(_pyro_utils, "get_peer_type", None)
-if _orig_get_peer_type is not None:
-    def _safe_get_peer_type(peer_id):
-        try:
-            return _orig_get_peer_type(peer_id)
-        except ValueError:
-            return "channel" if peer_id < 0 else "user"
-    _pyro_utils.get_peer_type = _safe_get_peer_type
-
-_QUIET_NOISE = ("Peer id invalid", "ID not found", "Connection lost",
-                "ConnectionResetError", "ConnectionClosed",
-                "CHANNEL_INVALID", "PEER_ID_INVALID")
-
-try:
-    import pyrogram.client as _pyro_client
-    _orig_handle_updates = _pyro_client.Client.handle_updates
-
-    async def _safe_handle_updates(self, updates):
-        try:
-            return await _orig_handle_updates(self, updates)
-        except Exception as _e:
-            _t = f"{type(_e).__name__}: {_e}"
-            if any(_k in _t for _k in _QUIET_NOISE):
-                return None
-            raise
-
-    _pyro_client.Client.handle_updates = _safe_handle_updates
-except Exception:
-    pass
-
-
-def _quiet_exception_handler(loop, context):
-    """Swallows Pyrogram's leftover asyncio task noise — cosmetic only."""
-    exc = context.get("exception")
-    text = f"{type(exc).__name__}: {exc}" if exc else str(context.get("message", ""))
-    if any(k in text for k in _QUIET_NOISE):
-        return
-    loop.default_exception_handler(context)
 
 # ===================== IMAGE ENGINE =====================
 from PIL import Image, ImageDraw, ImageFont
@@ -117,14 +67,30 @@ DATA_FILE = "data.json"
 DELAY_BETWEEN_MSGS = 3
 DELAY_BETWEEN_ACCOUNTS = 10
 
-# Chat types allowed in "Promo in ALL GCs" (works on both Pyrogram v1 & v2)
+# Chat types allowed (works on both Pyrogram v1 & v2)
 try:
     from pyrogram.enums import ChatType
     _CHAT_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP, ChatType.CHANNEL)
+    _DM_TYPES = (ChatType.PRIVATE, ChatType.BOT)
 except Exception:
     _CHAT_TYPES = ("group", "supergroup", "channel")
+    _DM_TYPES = ("private", "bot")
 
 bot = Client("promo_manager", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# ===================== PROMO TARGET MODE =====================
+TARGET_GC = "gc"
+TARGET_DM = "dm"
+TARGET_BOTH = "both"
+
+def target_label(t):
+    return {TARGET_GC: "📋 GC only", TARGET_DM: "💬 DM only",
+            TARGET_BOTH: "💬+📋 DM + GC"}.get(t, t)
+
+def target_active(d, which):
+    """True if the chosen target includes `which` (gc or dm)."""
+    t = d.get("target", TARGET_GC)
+    return t == which or t == TARGET_BOTH
 
 user_state = {}
 promo_state = {}
@@ -136,8 +102,8 @@ async def safe_stop(client):
         return
     try:
         await client.stop()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ [safe_stop] {type(e).__name__}: {e}")
 
 # ===================== DATA STORE (PER-USER) =====================
 def data_path(uid=None):
@@ -151,7 +117,7 @@ def load_data(uid=None):
             return json.load(f)
     return {"accounts": [], "groups": [], "message": "",
             "time": "", "running": False, "photo": "", "auto_image": True,
-            "mode": "once", "interval": 0}
+            "mode": "once", "interval": 0, "target": TARGET_GC}
 
 def save_data(uid, data):
     path = data_path(uid)
@@ -246,9 +212,10 @@ def main_kb():
         [InlineKeyboardButton("✏️ Custom Message", callback_data="set_msg"),
          InlineKeyboardButton("🖼️ Promo Photo", callback_data="photo_menu")],
         [InlineKeyboardButton("⏰ Set Time", callback_data="set_time"),
-         InlineKeyboardButton("📊 Current Promo", callback_data="status")],
+         InlineKeyboardButton("🎯 Promo Target", callback_data="target_menu")],
+        [InlineKeyboardButton("📊 Current Promo", callback_data="status")],
         [InlineKeyboardButton("🚀 START PROMO", callback_data="start_promo")],
-        [InlineKeyboardButton("🌐 Promo in ALL GCs (auto)", callback_data="promo_all")],
+        [InlineKeyboardButton("🌐 AUTO: ALL GCs + DMs", callback_data="promo_all")],
     ])
 
 def back_kb():
@@ -270,6 +237,18 @@ def time_kb():
         [InlineKeyboardButton("🔁 Loop Mode (repeat)", callback_data="time_loop")],
         [InlineKeyboardButton("🔙 Back", callback_data="back")],
     ])
+
+def target_kb(d):
+    t = d.get("target", TARGET_GC)
+    options = [
+        (TARGET_DM,  "💬 DM Only"),
+        (TARGET_GC,  "📋 GC Only"),
+        (TARGET_BOTH, "💬 + 📋 DM + GC"),
+    ]
+    kb = [[InlineKeyboardButton(("✅ " if t == k else "") + v, callback_data=f"target_set:{k}")]
+          for k, v in options]
+    kb.append([InlineKeyboardButton("🔙 Back", callback_data="back")])
+    return InlineKeyboardMarkup(kb)
 
 def photo_kb(d):
     kb = [[InlineKeyboardButton("🖼️ Send Photo", callback_data="photo_send")]]
@@ -342,11 +321,13 @@ def short_results(results, cap=25):
     return out
 
 async def safe_edit(chat_id, msg_id, text, kb=None):
-    """Edits the progress message without ever crashing the promo task."""
+    """Edits the progress message. Silent catches are ONLY for the normal
+    edit-race (message already edited by another callback) — that race is
+    expected and must not crash the promo task. Everything else is loud."""
     try:
         await bot.edit_message_text(chat_id, msg_id, text[:4000], reply_markup=kb)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ [edit race, ignoring] {type(e).__name__}: {e}")
 
 def build_status(d):
     lines = ["📊 **CURRENT PROMO**\n"]
@@ -364,6 +345,7 @@ def build_status(d):
         lines.append("🎨 Photo: auto-generate (image created from message)")
     else:
         lines.append("🖼️ Photo: ❌ none")
+    lines.append(f"🎯 Target: {target_label(d.get('target', TARGET_GC))}")
     mode = d.get("mode", "once")
     if mode == "loop":
         lines.append(f"🔁 Mode: LOOP — every {d.get('interval', 0)} min (until stopped)")
@@ -388,16 +370,17 @@ async def add_group_entry(entry, message):
                     except UserAlreadyParticipant:
                         pass
                     except FloodWait as e:
+                        print(f"⚠️ [join flood] {acc['name']}: waiting {e.x}s")
                         await asyncio.sleep(min(e.x, 300))
                         try:
                             chat = await user.join_chat(link)
                             entry["ids"][acc["name"]] = chat.id
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+                        except Exception as e2:
+                            print(f"⚠️ [join retry] {acc['name']}: {type(e2).__name__}: {e2}")
+                    except Exception as e:
+                        print(f"⚠️ [join] {acc['name']} → {link}: {type(e).__name__}: {e}")
+            except Exception as e:
+                print(f"⚠️ [join client] {acc['name']}: {type(e).__name__}: {e}")
     d["groups"].append(entry)
     save_data(uid, d)
 
@@ -411,8 +394,8 @@ async def resolve_chat_id(user, entry, acc_name):
             try:
                 async for _ in user.get_dialogs(limit=200):
                     pass
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ [dialog refresh] {acc_name}: {type(e).__name__}: {e}")
             try:
                 chat = await user.get_chat(entry["value"])
                 return chat.id, None
@@ -426,8 +409,8 @@ async def resolve_chat_id(user, entry, acc_name):
             await user.join_chat(entry["value"])
         except UserAlreadyParticipant:
             pass
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ [join username] {acc_name} → {entry['value']}: {type(e).__name__}: {e}")
         try:
             return (await user.get_chat(entry["value"])).id, None
         except Exception as e:
@@ -449,8 +432,8 @@ async def resolve_chat_id(user, entry, acc_name):
         try:
             async for _ in user.get_dialogs(limit=200):
                 pass
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ [dialog refresh] {acc_name}: {type(e).__name__}: {e}")
         cid = entry["ids"].get(acc_name)
         if cid is not None:
             try:
@@ -484,8 +467,8 @@ async def send_payload(user, chat_id, d, stop_event, force_text=False):
             try:
                 await user.send_photo(chat_id, photo, caption=caption)
                 remaining = split_text(rest) if rest else []
-            except Exception:
-                # photo failed (e.g. Peer id invalid) → fall back to plain text
+            except Exception as e:
+                print(f"⚠️ [photo send failed → text fallback] {type(e).__name__}: {e}")
                 remaining = split_text(text)
         elif auto:
             try:
@@ -493,10 +476,11 @@ async def send_payload(user, chat_id, d, stop_event, force_text=False):
                 try:
                     await user.send_photo(chat_id, img_path)   # full quote inside the image
                     remaining = split_text(text) if AUTO_SEND_TEXT else []
-                except Exception:
-                    # photo failed → fall back to plain text
+                except Exception as e:
+                    print(f"⚠️ [photo send failed → text fallback] {type(e).__name__}: {e}")
                     remaining = split_text(text)
-            except Exception:
+            except Exception as e:
+                print(f"⚠️ [image generation failed → text only] {type(e).__name__}: {e}")
                 remaining = split_text(text)   # if the image fails, send text only
         else:
             remaining = split_text(text)
@@ -508,6 +492,7 @@ async def send_payload(user, chat_id, d, stop_event, force_text=False):
         try:
             await user.send_message(chat_id, chunk)
         except FloodWait as e:
+            print(f"⚠️ [flood] waiting {e.x}s before resend")
             await asyncio.sleep(min(e.x, 300))
             if stop_event.is_set():
                 return "stopped"
@@ -526,11 +511,12 @@ async def send_to_group(user, entry, acc_name, d, stop_event):
         res = await send_payload(user, chat_id, d, stop_event, force_text=force_text)
         return "✅" if res == "✅" else f"❌ {res}"
     except FloodWait as e:
+        print(f"⚠️ [flood] {acc_name}: waiting {e.x}s")
         await asyncio.sleep(min(e.x, 300))
         res = await send_payload(user, chat_id, d, stop_event, force_text=force_text)
         return "✅" if res == "✅" else f"❌ {res}"
 
-# ===================== PROMO IN ALL GCS (NEW) =====================
+# ===================== DISCOVER CHATS (GCs + DMs) =====================
 async def discover_member_groups(user, d, acc_name):
     """
     Finds every group/channel where this account is a member,
@@ -547,12 +533,14 @@ async def discover_member_groups(user, d, acc_name):
         elif g["type"] == "username":
             try:
                 await user.join_chat(g["value"])
-            except Exception:
+            except UserAlreadyParticipant:
                 pass
+            except Exception as e:
+                print(f"⚠️ [GC discover join] {acc_name} → {g['value']}: {type(e).__name__}: {e}")
             try:
                 covered.add((await user.get_chat(g["value"])).id)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"⚠️ [GC discover get_chat] {acc_name} → {g['value']}: {type(e).__name__}: {e}")
 
     targets = []
     try:
@@ -564,16 +552,42 @@ async def discover_member_groups(user, d, acc_name):
             if c.id in covered:
                 continue
             targets.append(c)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ [GC discover dialogs] {acc_name}: {type(e).__name__}: {e}")
     return targets
 
+async def discover_dm_chats(user, d, acc_name):
+    """
+    NEW: Finds every private chat (DM) where this account has a conversation.
+    The promo bot's own chat is skipped so it doesn't DM itself.
+    """
+    bot_me_id = None
+    try:
+        bot_me_id = (await bot.get_me()).id
+    except Exception as e:
+        print(f"⚠️ [get_me] {type(e).__name__}: {e}")
+    targets = []
+    try:
+        async for dialog in user.get_dialogs(limit=500):
+            c = dialog.chat
+            if c.type not in _DM_TYPES:
+                continue
+            if bot_me_id is not None and c.id == bot_me_id:
+                continue  # skip the promo bot itself
+            targets.append(c)
+    except Exception as e:
+        print(f"⚠️ [DM discover dialogs] {acc_name}: {type(e).__name__}: {e}")
+    return targets
+
+# ===================== AUTO PROMO (ALL GCs + DMs) =====================
 async def run_promo_all(chat_id, progress_msg_id):
     d = load_data(chat_id)
     accounts = d["accounts"]
     time_str = d["time"]
     mode = d.get("mode", "once")
     interval = int(d.get("interval", 0) or 0)
+    gc_on = target_active(d, TARGET_GC)
+    dm_on = target_active(d, TARGET_DM)
 
     ev = asyncio.Event()
     promo_state[chat_id] = ev
@@ -582,14 +596,16 @@ async def run_promo_all(chat_id, progress_msg_id):
 
     results = []
     try:
+        tgt = target_label(d.get("target", TARGET_GC))
         if mode == "loop":
             wait_until = datetime.now()
             await safe_edit(
                 chat_id, progress_msg_id,
-                f"🔁 **PROMO TO ALL GCS (LOOP MODE)**\n\n"
+                f"🔁 **AUTO PROMO (LOOP MODE)**\n\n"
                 f"📱 Accounts: {len(accounts)}\n"
+                f"🎯 Target: {tgt}\n"
                 f"⏱ Interval: every {interval} min\n"
-                f"🌐 Every group/channel where the accounts are members will get the promo.\n"
+                f"🌐 Discovers every member GC + DM of the accounts and sends there.\n"
                 f"GCs already in your list are skipped.\n\n"
                 f"Tap 🛑 to stop.",
                 stop_kb(),
@@ -598,9 +614,11 @@ async def run_promo_all(chat_id, progress_msg_id):
             wait_until = compute_target(time_str)
             await safe_edit(
                 chat_id, progress_msg_id,
-                f"⏳ **PROMO TO ALL GCS SCHEDULED**\n\n"
+                f"⏳ **AUTO PROMO SCHEDULED**\n\n"
                 f"📱 Accounts: {len(accounts)}\n"
-                f"⏰ Time: {time_str} ({wait_until.strftime('%H:%M:%S')})\n\n"
+                f"🎯 Target: {tgt}\n"
+                f"⏰ Time: {time_str} ({wait_until.strftime('%H:%M:%S')})\n"
+                f"🌐 Discovers every member GC + DM of the accounts and sends there.\n\n"
                 f"Tap 🛑 to stop.",
                 stop_kb(),
             )
@@ -624,17 +642,21 @@ async def run_promo_all(chat_id, progress_msg_id):
                     break
                 await safe_edit(
                     chat_id, progress_msg_id,
-                    f"🌐 **Run #{run_number}** — {acc['name']} → discovering GCs... ({i}/{len(accounts)})",
+                    f"🌐 **Run #{run_number}** — {acc['name']} → discovering chats... ({i}/{len(accounts)})",
                     stop_kb(),
                 )
                 ok = fail = 0
                 try:
                     async with Client(f"pa_{chat_id}_{i}", API_ID, API_HASH,
                                       session_string=acc["session"], in_memory=True) as user:
-                        targets = await discover_member_groups(user, d, acc["name"])
+                        targets = []
+                        if gc_on:
+                            targets += await discover_member_groups(user, d, acc["name"])
+                        if dm_on:
+                            targets += await discover_dm_chats(user, d, acc["name"])
                         await safe_edit(
                             chat_id, progress_msg_id,
-                            f"🌐 **Run #{run_number}** — {acc['name']} → {len(targets)} new GCs, sending... ({i}/{len(accounts)})",
+                            f"🌐 **Run #{run_number}** — {acc['name']} → {len(targets)} chats, sending... ({i}/{len(accounts)})",
                             stop_kb(),
                         )
                         for c in targets:
@@ -646,15 +668,15 @@ async def run_promo_all(chat_id, progress_msg_id):
                                     ok += 1
                                 else:
                                     fail += 1
-                                    results.append(f"❌ {acc['name']} → {c.title or c.id}: {res}")
+                                    results.append(f"❌ {acc['name']} → {c.title or c.first_name or c.id}: {res}")
                             except Exception as e:
                                 fail += 1
-                                results.append(f"❌ {acc['name']} → {c.title or c.id}: {e}")
+                                results.append(f"❌ {acc['name']} → {c.title or c.first_name or c.id}: {e}")
                 except Exception as e:
                     fail += 1
                     results.append(f"❌ {acc['name']}: {e}")
                 if ok == 0 and fail == 0:
-                    results.append(f"ℹ️ {acc['name']}: no new GCs found (all are already in your list)")
+                    results.append(f"ℹ️ {acc['name']}: no new chats found")
                 results.append(f"{'✅' if fail == 0 else '⚠️'} {acc['name']}: {ok} ok / {fail} fail")
                 await asyncio.sleep(DELAY_BETWEEN_ACCOUNTS)
 
@@ -677,7 +699,7 @@ async def run_promo_all(chat_id, progress_msg_id):
                 # one-time mode: finished
                 await safe_edit(
                     chat_id, progress_msg_id,
-                    f"🏁 **PROMO TO ALL GCS DONE**\n\n" + "\n".join(short_results(results)),
+                    f"🏁 **AUTO PROMO DONE**\n\n" + "\n".join(short_results(results)),
                     main_kb(),
                 )
                 break
@@ -701,6 +723,8 @@ async def run_promo(chat_id, progress_msg_id):
     time_str = d["time"]
     mode = d.get("mode", "once")
     interval = int(d.get("interval", 0) or 0)
+    gc_on = target_active(d, TARGET_GC)
+    dm_on = target_active(d, TARGET_DM)
 
     ev = asyncio.Event()
     promo_state[chat_id] = ev
@@ -709,13 +733,15 @@ async def run_promo(chat_id, progress_msg_id):
 
     results = []
     try:
+        tgt = target_label(d.get("target", TARGET_GC))
         if mode == "loop":
             # loop mode: starts immediately, repeats every `interval` minutes
             wait_until = datetime.now()
             await safe_edit(
                 chat_id, progress_msg_id,
                 f"🔁 **PROMO STARTING (LOOP MODE)**\n\n"
-                f"📱 Accounts: {len(accounts)}\n📋 Groups: {len(groups)}\n"
+                f"📱 Accounts: {len(accounts)}\n"
+                f"🎯 Target: {tgt}\n"
                 f"⏱ Interval: every {interval} min\n"
                 f"▶️ Runs now, then repeats until you stop it.\n\n"
                 f"Tap 🛑 to stop.",
@@ -726,7 +752,8 @@ async def run_promo(chat_id, progress_msg_id):
             await safe_edit(
                 chat_id, progress_msg_id,
                 f"⏳ **PROMO SCHEDULED**\n\n"
-                f"📱 Accounts: {len(accounts)}\n📋 Groups: {len(groups)}\n"
+                f"📱 Accounts: {len(accounts)}\n"
+                f"🎯 Target: {tgt}\n"
                 f"⏰ Time: {time_str} ({wait_until.strftime('%H:%M:%S')})\n\n"
                 f"Tap 🛑 to stop.",
                 stop_kb(),
@@ -758,18 +785,43 @@ async def run_promo(chat_id, progress_msg_id):
                 try:
                     async with Client(f"pr_{chat_id}_{i}", API_ID, API_HASH,
                                       session_string=acc["session"], in_memory=True) as user:
-                        for entry in groups:
-                            res = await send_to_group(user, entry, acc["name"], d, ev)
-                            if res == "✅":
-                                ok += 1
-                            else:
-                                fail += 1
-                                results.append(f"❌ {acc['name']} → {entry['raw']}: {res}")
-                            if ev.is_set():
-                                break
+                        # ---- GC part (saved groups) ----
+                        if gc_on and groups:
+                            for entry in groups:
+                                res = await send_to_group(user, entry, acc["name"], d, ev)
+                                if res == "✅":
+                                    ok += 1
+                                else:
+                                    fail += 1
+                                    results.append(f"❌ {acc['name']} → {entry['raw']}: {res}")
+                                if ev.is_set():
+                                    break
+                        # ---- DM part (all private chats) ----
+                        if dm_on and not ev.is_set():
+                            dms = await discover_dm_chats(user, d, acc["name"])
+                            await safe_edit(
+                                chat_id, progress_msg_id,
+                                f"⏳ **Run #{run_number}** — {acc['name']} → {len(dms)} DMs, sending... ({i}/{len(accounts)})",
+                                stop_kb(),
+                            )
+                            for c in dms:
+                                if ev.is_set():
+                                    break
+                                try:
+                                    res = await send_payload(user, c.id, d, ev, force_text=False)
+                                    if res == "✅":
+                                        ok += 1
+                                    else:
+                                        fail += 1
+                                        results.append(f"❌ {acc['name']} → DM {c.first_name or c.id}: {res}")
+                                except Exception as e:
+                                    fail += 1
+                                    results.append(f"❌ {acc['name']} → DM {c.first_name or c.id}: {e}")
                 except Exception as e:
                     fail += 1
                     results.append(f"❌ {acc['name']}: {e}")
+                if ok == 0 and fail == 0:
+                    results.append(f"ℹ️ {acc['name']}: nothing to send (check 🎯 target and saved groups)")
                 results.append(f"{'✅' if fail == 0 else '⚠️'} {acc['name']}: {ok} ok / {fail} fail")
                 await asyncio.sleep(DELAY_BETWEEN_ACCOUNTS)
 
@@ -850,16 +902,23 @@ async def help_cmd(client, message: Message):
    — same font, emojis rendered properly 🎨
 • If no photo is set, auto-generate is the default
 
-**5️⃣ SET TIME — choose a mode**
+**5️⃣ PROMO TARGET — DM / GC / BOTH 🎯**
+• Tap 🎯 Promo Target and choose:
+• 💬 **DM Only** — sends to EVERY private chat (DM) the account has
+• 📋 **GC Only** — saved groups only (or all member GCs in AUTO)
+• 💬 + 📋 **DM + GC** — both DMs and groups
+• This setting applies to both 🚀 START PROMO and 🌐 AUTO promo
+
+**6️⃣ SET TIME — choose a mode**
 • Tap ⏰ Set Time → pick one:
 • 🕐 **One-Time** — `5` = 5 minutes from now | `14:30` = today at 14:30 (tomorrow if already passed)
 • 🔁 **Loop Mode** — send interval in minutes (`10`, `30`, `60`...)
    — promo runs NOW, then repeats every X minutes until you tap 🛑
 
-**6️⃣ START**
-• Tap 🚀 **START PROMO** — sends photo + message to your saved GC list 🚀
-• Tap 🌐 **Promo in ALL GCs** — automatically finds EVERY group/channel
-  where your accounts are members and sends there too
+**7️⃣ START**
+• Tap 🚀 **START PROMO** — sends to your saved GC list (+ DMs if target says so) 🚀
+• Tap 🌐 **AUTO PROMO** — automatically finds EVERY group/channel AND private chat
+  where your accounts are members/talking and sends there
   (GCs already in your list are skipped, no duplicates)
 • Tap 🛑 STOP PROMO to stop mid-run (also stops the loop)
 • After stopping: **🚀 RESTART PROMO** runs again with the same settings,
@@ -870,6 +929,7 @@ async def help_cmd(client, message: Message):
 
 **⚠️ NOTE:** Sending too fast may get your Telegram account **banned**.
 Delays are set (3s msgs / 10s accounts) — change them at the top of the code.
+DM promo especially: too many DMs to strangers = quick ban risk.
 
 /cancel — cancel any current step"""
     await message.reply_text(text)
@@ -892,8 +952,8 @@ async def send_session_file(message, phone, session):
                     "⚠️ Anyone who has this string can fully control this account.\n"
                     "✅ You can also use this session in any other Pyrogram tool.",
         )
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"⚠️ [session file] {type(e).__name__}: {e}")
 
 # ===================== CALLBACKS =====================
 @bot.on_callback_query()
@@ -1023,6 +1083,30 @@ async def on_cb(client, cb: CallbackQuery):
         )
         await cb.answer(); return
 
+    if data == "target_menu":
+        await cb.message.edit_text(
+            "🎯 **PROMO TARGET**\n\n"
+            "Choose where the promo goes:\n\n"
+            "• 💬 **DM Only** — every private chat (DM) the account has\n"
+            "• 📋 **GC Only** — saved groups (or all member GCs in AUTO)\n"
+            "• 💬 + 📋 **DM + GC** — both together\n\n"
+            f"Current: **{target_label(d.get('target', TARGET_GC))}**\n\n"
+            "Applies to 🚀 START PROMO and 🌐 AUTO promo.",
+            reply_markup=target_kb(d),
+        )
+        await cb.answer(); return
+
+    if data.startswith("target_set:"):
+        d["target"] = data.split(":")[1]
+        save_data(chat_id, d)
+        await cb.answer(f"✅ Target: {target_label(d['target'])}", show_alert=True)
+        await cb.message.edit_text(
+            f"✅ **Target set: {target_label(d['target'])}**\n\n"
+            "Applies to 🚀 START PROMO and 🌐 AUTO promo.",
+            reply_markup=target_kb(d),
+        )
+        return
+
     if data == "status":
         await cb.message.edit_text(build_status(d), reply_markup=main_kb())
         await cb.answer(); return
@@ -1032,7 +1116,8 @@ async def on_cb(client, cb: CallbackQuery):
     if data in ("start_promo", "restart_promo"):
         missing = []
         if not d["accounts"]: missing.append("accounts")
-        if not d["groups"]: missing.append("groups")
+        if target_active(d, TARGET_GC) and not d["groups"]:
+            missing.append("groups")
         if not d["message"]: missing.append("message")
         mode = d.get("mode", "once")
         if mode == "loop":
@@ -1053,7 +1138,7 @@ async def on_cb(client, cb: CallbackQuery):
         await cb.answer(); return
 
     if data == "promo_all":
-        # "Promo in ALL GCs" — no saved GC list needed, groups are auto-discovered
+        # "AUTO" — no saved GC list needed, chats are auto-discovered (GCs + DMs)
         missing = []
         if not d["accounts"]: missing.append("accounts")
         if not d["message"]: missing.append("message")
@@ -1071,7 +1156,7 @@ async def on_cb(client, cb: CallbackQuery):
         if d.get("running"):
             d["running"] = False   # stale flag after a restart
             save_data(chat_id, d)
-        msg = await cb.message.edit_text("🌐 **PROMO TO ALL GCS IS STARTING...**")
+        msg = await cb.message.edit_text("🌐 **AUTO PROMO IS STARTING...**")
         asyncio.create_task(run_promo_all(chat_id, msg.id))
         await cb.answer(); return
 
@@ -1086,6 +1171,7 @@ async def on_cb(client, cb: CallbackQuery):
                 pass
             await cb.answer("🛑 Stopping...")
         else:
+            # no runner active → show the stopped state anyway
             # no runner active → show the stopped state anyway
             try:
                 await cb.message.edit_text(
@@ -1354,10 +1440,8 @@ async def handle_photo(client, message: Message):
 
 # ===================== MAIN =====================
 async def main():
-    loop = asyncio.get_running_loop()
-    loop.set_exception_handler(_quiet_exception_handler)
     await bot.start()
-    print("🤖 Promo Bot v2 running — press Ctrl+C to stop.")
+    print("🤖 Promo Bot v2.1 running — press Ctrl+C to stop.")
     await idle()
     await bot.stop()
 
@@ -1371,9 +1455,9 @@ if __name__ == "__main__":
                 dd["running"] = False
                 with open(path, "w", encoding="utf-8") as f:
                     json.dump(dd, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
-    print("🤖 Promo Bot v2 starting...")
+        except Exception as e:
+            print(f"⚠️ [stale flag reset] {path}: {type(e).__name__}: {e}")
+    print("🤖 Promo Bot v2.1 starting...")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
