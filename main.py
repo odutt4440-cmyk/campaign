@@ -9,7 +9,7 @@
 + 🌐 NEW: "Promo in ALL GCs" — sends to every group/channel the account is a member of
 + 🔐 NEW: per-user private data (nobody sees another user's accounts/groups)
 + 🔑 NEW: session.txt is given to the user after login (usable anywhere)
-+ 🛑 FIX: STOP PROMO now always updates the message (chunked wait, safe edits)
++ 🛑 FIX: STOP PROMO → message becomes "PROMO STOPPED" with RESTART + Menu buttons
 + 🔇 FIX: "Peer id invalid" console spam is silenced (cosmetic noise only)
 
 Install: pip install pyrogram tgcrypto pillow pilmoji requests python-dotenv
@@ -256,6 +256,13 @@ def back_kb():
 
 def stop_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 STOP PROMO", callback_data="stop_promo")]])
+
+def stopped_kb():
+    """Shown after STOP: restart with the same saved settings + main menu."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚀 RESTART PROMO", callback_data="restart_promo")],
+        [InlineKeyboardButton("🏠 Menu", callback_data="back")],
+    ])
 
 def time_kb():
     return InlineKeyboardMarkup([
@@ -677,10 +684,10 @@ async def run_promo_all(chat_id, progress_msg_id):
 
         # stopped mid-run (during wait or sending)
         if ev.is_set():
-            txt = "🛑 **PROMO STOPPED**\n\nYou can start again anytime with 🚀 START PROMO."
+            txt = "🛑 **PROMO STOPPED**\n\nPromo is no longer sending."
             if results:
                 txt += "\n\n" + "\n".join(short_results(results))
-            await safe_edit(chat_id, progress_msg_id, txt, main_kb())
+            await safe_edit(chat_id, progress_msg_id, txt, stopped_kb())
     finally:
         d = load_data(chat_id)
         d["running"] = False
@@ -792,10 +799,10 @@ async def run_promo(chat_id, progress_msg_id):
 
         # stopped mid-run (during wait or sending)
         if ev.is_set():
-            txt = "🛑 **PROMO STOPPED**\n\nYou can start again anytime with 🚀 START PROMO."
+            txt = "🛑 **PROMO STOPPED**\n\nPromo is no longer sending."
             if results:
                 txt += "\n\n" + "\n".join(short_results(results))
-            await safe_edit(chat_id, progress_msg_id, txt, main_kb())
+            await safe_edit(chat_id, progress_msg_id, txt, stopped_kb())
     finally:
         d = load_data(chat_id)
         d["running"] = False
@@ -855,6 +862,8 @@ async def help_cmd(client, message: Message):
   where your accounts are members and sends there too
   (GCs already in your list are skipped, no duplicates)
 • Tap 🛑 STOP PROMO to stop mid-run (also stops the loop)
+• After stopping: **🚀 RESTART PROMO** runs again with the same settings,
+  **🏠 Menu** takes you back to all options
 
 **🔐 PRIVACY**
 • Your data is stored per-user — nobody else can see your accounts, groups or sessions
@@ -1018,7 +1027,9 @@ async def on_cb(client, cb: CallbackQuery):
         await cb.message.edit_text(build_status(d), reply_markup=main_kb())
         await cb.answer(); return
 
-    if data == "start_promo":
+    # "start_promo" (main menu) and "restart_promo" (after STOP) do the same thing:
+    # launch the promo with the user's saved settings.
+    if data in ("start_promo", "restart_promo"):
         missing = []
         if not d["accounts"]: missing.append("accounts")
         if not d["groups"]: missing.append("groups")
@@ -1068,13 +1079,24 @@ async def on_cb(client, cb: CallbackQuery):
         ev = promo_state.get(chat_id)
         if ev:
             ev.set()
-            # immediate feedback on the message itself (runner finalizes it)
+            # instant feedback on the message itself
             try:
                 await cb.message.edit_text("🛑 **STOPPING PROMO...**", reply_markup=stop_kb())
             except Exception:
                 pass
             await cb.answer("🛑 Stopping...")
         else:
+            # no runner active → show the stopped state anyway
+            try:
+                await cb.message.edit_text(
+                    "🛑 **PROMO STOPPED**\n\n"
+                    "Promo is no longer sending.\n\n"
+                    "• 🚀 **RESTART PROMO** — runs again with the same saved settings\n"
+                    "• 🏠 **Menu** — back to all options",
+                    reply_markup=stopped_kb(),
+                )
+            except Exception:
+                pass
             await cb.answer("No promo is running right now.")
         return
 
