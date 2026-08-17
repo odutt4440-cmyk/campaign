@@ -1,6 +1,0 @@
-pyrogram>=2.0.0
-tgcrypto>=1.2.5
-Pillow>=9.0.0
-pilmoji>=1.4.0
-python-dotenv>=1.0.0
-requests>=2.28.0
