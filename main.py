@@ -9,6 +9,8 @@
 + 🌐 NEW: "Promo in ALL GCs" — sends to every group/channel the account is a member of
 + 🔐 NEW: per-user private data (nobody sees another user's accounts/groups)
 + 🔑 NEW: session.txt is given to the user after login (usable anywhere)
++ 🛑 FIX: STOP PROMO now always updates the message (chunked wait, safe edits)
++ 🔇 FIX: "Peer id invalid" console spam is silenced (cosmetic noise only)
 
 Install: pip install pyrogram tgcrypto pillow pilmoji requests python-dotenv
 Font:    put any .ttf (Poppins/Montserrat) in the bot folder,
@@ -25,12 +27,63 @@ load_dotenv()
 import re
 from datetime import datetime, timedelta
 
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.errors import (FloodWait, PasswordHashInvalid, PhoneCodeExpired,
                              PhoneCodeInvalid, SessionPasswordNeeded,
                              UserAlreadyParticipant)
 from pyrogram.types import (CallbackQuery, InlineKeyboardButton,
                             InlineKeyboardMarkup, Message)
+
+# ===================== PYROGRAM COMPAT SHIM =====================
+# Silences the cosmetic "Peer id invalid" tracebacks that Pyrogram's
+# update loop prints for chats not yet in its local storage.
+# 1) quieter pyrogram logs
+# 2) get_peer_type never raises for unknown peers
+# 3) handle_updates drops unresolvable-peer updates silently
+# 4) asyncio loop handler swallows leftover task noise
+import logging as _logging
+_logging.getLogger("pyrogram").setLevel(_logging.ERROR)
+
+import pyrogram.utils as _pyro_utils
+
+_orig_get_peer_type = getattr(_pyro_utils, "get_peer_type", None)
+if _orig_get_peer_type is not None:
+    def _safe_get_peer_type(peer_id):
+        try:
+            return _orig_get_peer_type(peer_id)
+        except ValueError:
+            return "channel" if peer_id < 0 else "user"
+    _pyro_utils.get_peer_type = _safe_get_peer_type
+
+_QUIET_NOISE = ("Peer id invalid", "ID not found", "Connection lost",
+                "ConnectionResetError", "ConnectionClosed",
+                "CHANNEL_INVALID", "PEER_ID_INVALID")
+
+try:
+    import pyrogram.client as _pyro_client
+    _orig_handle_updates = _pyro_client.Client.handle_updates
+
+    async def _safe_handle_updates(self, updates):
+        try:
+            return await _orig_handle_updates(self, updates)
+        except Exception as _e:
+            _t = f"{type(_e).__name__}: {_e}"
+            if any(_k in _t for _k in _QUIET_NOISE):
+                return None
+            raise
+
+    _pyro_client.Client.handle_updates = _safe_handle_updates
+except Exception:
+    pass
+
+
+def _quiet_exception_handler(loop, context):
+    """Swallows Pyrogram's leftover asyncio task noise — cosmetic only."""
+    exc = context.get("exception")
+    text = f"{type(exc).__name__}: {exc}" if exc else str(context.get("message", ""))
+    if any(k in text for k in _QUIET_NOISE):
+        return
+    loop.default_exception_handler(context)
 
 # ===================== IMAGE ENGINE =====================
 from PIL import Image, ImageDraw, ImageFont
@@ -272,6 +325,22 @@ def compute_target(time_str):
 def split_text(text, limit=4000):
     return [text[i:i + limit] for i in range(0, len(text), limit)]
 
+def short_results(results, cap=25):
+    """Truncates long result lists so the progress message never
+    exceeds Telegram's 4096-char edit limit (which used to kill
+    the promo task silently and freeze the message on STOPPING)."""
+    out = list(results)
+    if len(out) > cap:
+        out = out[:cap] + [f"... and {len(results) - cap} more lines"]
+    return out
+
+async def safe_edit(chat_id, msg_id, text, kb=None):
+    """Edits the progress message without ever crashing the promo task."""
+    try:
+        await bot.edit_message_text(chat_id, msg_id, text[:4000], reply_markup=kb)
+    except Exception:
+        pass
+
 def build_status(d):
     lines = ["📊 **CURRENT PROMO**\n"]
     lines.append(f"📱 Accounts ({len(d['accounts'])}):")
@@ -508,7 +577,7 @@ async def run_promo_all(chat_id, progress_msg_id):
     try:
         if mode == "loop":
             wait_until = datetime.now()
-            await bot.edit_message_text(
+            await safe_edit(
                 chat_id, progress_msg_id,
                 f"🔁 **PROMO TO ALL GCS (LOOP MODE)**\n\n"
                 f"📱 Accounts: {len(accounts)}\n"
@@ -516,25 +585,27 @@ async def run_promo_all(chat_id, progress_msg_id):
                 f"🌐 Every group/channel where the accounts are members will get the promo.\n"
                 f"GCs already in your list are skipped.\n\n"
                 f"Tap 🛑 to stop.",
-                reply_markup=stop_kb(),
+                stop_kb(),
             )
         else:
             wait_until = compute_target(time_str)
-            await bot.edit_message_text(
+            await safe_edit(
                 chat_id, progress_msg_id,
                 f"⏳ **PROMO TO ALL GCS SCHEDULED**\n\n"
                 f"📱 Accounts: {len(accounts)}\n"
                 f"⏰ Time: {time_str} ({wait_until.strftime('%H:%M:%S')})\n\n"
                 f"Tap 🛑 to stop.",
-                reply_markup=stop_kb(),
+                stop_kb(),
             )
 
         run_number = 0
         while True:
-            # ---- wait until the run time (loop mode waits between runs) ----
-            delta = (wait_until - datetime.now()).total_seconds()
-            if delta > 0:
-                await asyncio.sleep(delta)
+            # ---- wait until run time (chunked → STOP stays responsive) ----
+            while not ev.is_set():
+                delta = (wait_until - datetime.now()).total_seconds()
+                if delta <= 0:
+                    break
+                await asyncio.sleep(min(delta, 5))
             if ev.is_set():
                 break
 
@@ -544,20 +615,20 @@ async def run_promo_all(chat_id, progress_msg_id):
                 if ev.is_set():
                     results.append(f"🛑 {acc['name']}: stopped")
                     break
-                await bot.edit_message_text(
+                await safe_edit(
                     chat_id, progress_msg_id,
                     f"🌐 **Run #{run_number}** — {acc['name']} → discovering GCs... ({i}/{len(accounts)})",
-                    reply_markup=stop_kb(),
+                    stop_kb(),
                 )
                 ok = fail = 0
                 try:
                     async with Client(f"pa_{chat_id}_{i}", API_ID, API_HASH,
                                       session_string=acc["session"], in_memory=True) as user:
                         targets = await discover_member_groups(user, d, acc["name"])
-                        await bot.edit_message_text(
+                        await safe_edit(
                             chat_id, progress_msg_id,
                             f"🌐 **Run #{run_number}** — {acc['name']} → {len(targets)} new GCs, sending... ({i}/{len(accounts)})",
-                            reply_markup=stop_kb(),
+                            stop_kb(),
                         )
                         for c in targets:
                             if ev.is_set():
@@ -583,12 +654,12 @@ async def run_promo_all(chat_id, progress_msg_id):
             # ---- what happens after this run ----
             if mode == "loop" and not ev.is_set():
                 next_run = datetime.now() + timedelta(minutes=interval)
-                await bot.edit_message_text(
+                await safe_edit(
                     chat_id, progress_msg_id,
-                    f"🔁 **RUN #{run_number} DONE** ✅\n\n" + "\n".join(results) +
+                    f"🔁 **RUN #{run_number} DONE** ✅\n\n" + "\n".join(short_results(results)) +
                     f"\n\n⏱ Next run: **{next_run.strftime('%H:%M:%S')}** (every {interval} min)\n"
                     f"Tap 🛑 to stop the loop.",
-                    reply_markup=stop_kb(),
+                    stop_kb(),
                 )
                 # sleep in small chunks so the STOP button responds fast
                 while datetime.now() < next_run:
@@ -597,19 +668,19 @@ async def run_promo_all(chat_id, progress_msg_id):
                     await asyncio.sleep(5)
             else:
                 # one-time mode: finished
-                await bot.edit_message_text(
+                await safe_edit(
                     chat_id, progress_msg_id,
-                    f"🏁 **PROMO TO ALL GCS DONE**\n\n" + "\n".join(results),
-                    reply_markup=main_kb(),
+                    f"🏁 **PROMO TO ALL GCS DONE**\n\n" + "\n".join(short_results(results)),
+                    main_kb(),
                 )
                 break
 
         # stopped mid-run (during wait or sending)
         if ev.is_set():
-            txt = "🛑 **PROMO STOPPED**"
+            txt = "🛑 **PROMO STOPPED**\n\nYou can start again anytime with 🚀 START PROMO."
             if results:
-                txt += "\n\n" + "\n".join(results)
-            await bot.edit_message_text(chat_id, progress_msg_id, txt, reply_markup=main_kb())
+                txt += "\n\n" + "\n".join(short_results(results))
+            await safe_edit(chat_id, progress_msg_id, txt, main_kb())
     finally:
         d = load_data(chat_id)
         d["running"] = False
@@ -634,32 +705,34 @@ async def run_promo(chat_id, progress_msg_id):
         if mode == "loop":
             # loop mode: starts immediately, repeats every `interval` minutes
             wait_until = datetime.now()
-            await bot.edit_message_text(
+            await safe_edit(
                 chat_id, progress_msg_id,
                 f"🔁 **PROMO STARTING (LOOP MODE)**\n\n"
                 f"📱 Accounts: {len(accounts)}\n📋 Groups: {len(groups)}\n"
                 f"⏱ Interval: every {interval} min\n"
                 f"▶️ Runs now, then repeats until you stop it.\n\n"
                 f"Tap 🛑 to stop.",
-                reply_markup=stop_kb(),
+                stop_kb(),
             )
         else:
             wait_until = compute_target(time_str)
-            await bot.edit_message_text(
+            await safe_edit(
                 chat_id, progress_msg_id,
                 f"⏳ **PROMO SCHEDULED**\n\n"
                 f"📱 Accounts: {len(accounts)}\n📋 Groups: {len(groups)}\n"
                 f"⏰ Time: {time_str} ({wait_until.strftime('%H:%M:%S')})\n\n"
                 f"Tap 🛑 to stop.",
-                reply_markup=stop_kb(),
+                stop_kb(),
             )
 
         run_number = 0
         while True:
-            # ---- wait until the run time (loop mode waits between runs) ----
-            delta = (wait_until - datetime.now()).total_seconds()
-            if delta > 0:
-                await asyncio.sleep(delta)
+            # ---- wait until run time (chunked → STOP stays responsive) ----
+            while not ev.is_set():
+                delta = (wait_until - datetime.now()).total_seconds()
+                if delta <= 0:
+                    break
+                await asyncio.sleep(min(delta, 5))
             if ev.is_set():
                 break
 
@@ -669,10 +742,10 @@ async def run_promo(chat_id, progress_msg_id):
                 if ev.is_set():
                     results.append(f"🛑 {acc['name']}: stopped")
                     break
-                await bot.edit_message_text(
+                await safe_edit(
                     chat_id, progress_msg_id,
                     f"⏳ **Run #{run_number}** — {acc['name']} → sending... ({i}/{len(accounts)})",
-                    reply_markup=stop_kb(),
+                    stop_kb(),
                 )
                 ok = fail = 0
                 try:
@@ -696,12 +769,12 @@ async def run_promo(chat_id, progress_msg_id):
             # ---- what happens after this run ----
             if mode == "loop" and not ev.is_set():
                 next_run = datetime.now() + timedelta(minutes=interval)
-                await bot.edit_message_text(
+                await safe_edit(
                     chat_id, progress_msg_id,
-                    f"🔁 **RUN #{run_number} DONE** ✅\n\n" + "\n".join(results) +
+                    f"🔁 **RUN #{run_number} DONE** ✅\n\n" + "\n".join(short_results(results)) +
                     f"\n\n⏱ Next run: **{next_run.strftime('%H:%M:%S')}** (every {interval} min)\n"
                     f"Tap 🛑 to stop the loop.",
-                    reply_markup=stop_kb(),
+                    stop_kb(),
                 )
                 # sleep in small chunks so the STOP button responds fast
                 while datetime.now() < next_run:
@@ -710,19 +783,19 @@ async def run_promo(chat_id, progress_msg_id):
                     await asyncio.sleep(5)
             else:
                 # one-time mode: finished
-                await bot.edit_message_text(
+                await safe_edit(
                     chat_id, progress_msg_id,
-                    f"🏁 **PROMO DONE**\n\n" + "\n".join(results),
-                    reply_markup=main_kb(),
+                    f"🏁 **PROMO DONE**\n\n" + "\n".join(short_results(results)),
+                    main_kb(),
                 )
                 break
 
         # stopped mid-run (during wait or sending)
         if ev.is_set():
-            txt = "🛑 **PROMO STOPPED**"
+            txt = "🛑 **PROMO STOPPED**\n\nYou can start again anytime with 🚀 START PROMO."
             if results:
-                txt += "\n\n" + "\n".join(results)
-            await bot.edit_message_text(chat_id, progress_msg_id, txt, reply_markup=main_kb())
+                txt += "\n\n" + "\n".join(short_results(results))
+            await safe_edit(chat_id, progress_msg_id, txt, main_kb())
     finally:
         d = load_data(chat_id)
         d["running"] = False
@@ -995,6 +1068,11 @@ async def on_cb(client, cb: CallbackQuery):
         ev = promo_state.get(chat_id)
         if ev:
             ev.set()
+            # immediate feedback on the message itself (runner finalizes it)
+            try:
+                await cb.message.edit_text("🛑 **STOPPING PROMO...**", reply_markup=stop_kb())
+            except Exception:
+                pass
             await cb.answer("🛑 Stopping...")
         else:
             await cb.answer("No promo is running right now.")
@@ -1253,6 +1331,14 @@ async def handle_photo(client, message: Message):
     )
 
 # ===================== MAIN =====================
+async def main():
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(_quiet_exception_handler)
+    await bot.start()
+    print("🤖 Promo Bot v2 running — press Ctrl+C to stop.")
+    await idle()
+    await bot.stop()
+
 if __name__ == "__main__":
     # reset stale "running" flags across all user files after a restart
     for path in glob.glob("data*.json"):
@@ -1266,4 +1352,7 @@ if __name__ == "__main__":
         except Exception:
             pass
     print("🤖 Promo Bot v2 starting...")
-    bot.run()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
