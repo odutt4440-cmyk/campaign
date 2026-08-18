@@ -17,26 +17,25 @@ from pyrogram.errors import (
 )
 
 # ------------------------------------------------------------------
-# CONFIGURATION (FETCHED FROM RAILWAY ENVIRONMENT VARIABLES)
+# CONFIGURATION
 # ------------------------------------------------------------------
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
-# Initialize Logging
+# Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# In-Memory Storage for String Sessions
-# Format: {"+123456789": "session_string_here"}
+# Multi-Tenant In-Memory Storage
+# Structure: { user_id: { "phone_number": "session_string" } }
 user_sessions = {}
 
-# In-Memory Workflow State Tracker
+# Workflow state tracker per user
 user_states = {}
 
-# Initialize Admin Bot Client
-bot = Client("admin_promo_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Initialize Main Bot Client
+bot = Client("public_promo_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 # ------------------------------------------------------------------
 # KEYBOARDS
@@ -65,29 +64,28 @@ def media_choice_keyboard():
     ])
 
 # ------------------------------------------------------------------
-# ACCESS CONTROL FILTER
+# IGNORE GROUPS FILTER (PRIVATE DM ONLY)
 # ------------------------------------------------------------------
-@bot.on_message(~filters.user(ADMIN_ID))
-@bot.on_callback_query(~filters.user(ADMIN_ID))
-async def restrict_unauthorized_access(client: Client, update):
-    if isinstance(update, CallbackQuery):
-        await update.answer("⚠️ Access Denied: You are not authorized to use this bot.", show_alert=True)
-    elif isinstance(update, Message):
-        await update.reply_text("⚠️ **Access Denied:** Private instance.")
+@bot.on_message(~filters.private)
+async def ignore_groups(client: Client, message: Message):
+    return
 
 # ------------------------------------------------------------------
-# ADMIN BOT HANDLERS
+# MAIN BOT COMMANDS & CALLBACKS
 # ------------------------------------------------------------------
-@bot.on_message(filters.command("start") & filters.user(ADMIN_ID))
+@bot.on_message(filters.command("start") & filters.private)
 async def start_command(client: Client, message: Message):
-    user_states.pop(message.from_user.id, None)
+    user_id = message.from_user.id
+    user_states.pop(user_id, None)
     await message.reply_text(
         "👋 **Welcome to Multi-Account Promo Automation Bot**\n\n"
-        "Manage your accounts, generate downloadable session files, and execute broadcasts.",
+        "Here you can connect your Telegram accounts, download session files, "
+        "and securely send promotional messages across your joined groups and DMs.\n\n"
+        "🔒 **Privacy Guaranteed:** Your added accounts and sessions are visible ONLY to you.",
         reply_markup=main_menu_keyboard()
     )
 
-@bot.on_callback_query(filters.user(ADMIN_ID))
+@bot.on_callback_query()
 async def handle_callbacks(client: Client, callback: CallbackQuery):
     data = callback.data
     user_id = callback.from_user.id
@@ -107,7 +105,7 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
         )
 
     # --------------------------------------------------------------
-    # ACCOUNT MANAGEMENT
+    # MY ACCOUNTS (USER SPECIFIC ONLY)
     # --------------------------------------------------------------
     elif data == "add_account":
         user_states[user_id] = {"step": "AWAITING_PHONE"}
@@ -117,15 +115,16 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
         )
 
     elif data == "my_accounts":
-        if not user_sessions:
+        my_accs = user_sessions.get(user_id, {})
+        if not my_accs:
             await callback.message.edit_text(
-                "ℹ️ **No active sessions added yet.**",
+                "ℹ️ **You have no active accounts added.**",
                 reply_markup=main_menu_keyboard()
             )
             return
 
         buttons = []
-        for phone in list(user_sessions.keys()):
+        for phone in list(my_accs.keys()):
             buttons.append([
                 InlineKeyboardButton(f"👤 {phone}", callback_data=f"acc_info_{phone}"),
                 InlineKeyboardButton("❌ Remove", callback_data=f"remove_acc_{phone}")
@@ -133,15 +132,15 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
         buttons.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")])
 
         await callback.message.edit_text(
-            f"📋 **Connected Accounts ({len(user_sessions)}):**\n"
-            "Click 'Remove' to disconnect and wipe session from memory.",
+            f"📋 **Your Connected Accounts ({len(my_accs)}):**\n"
+            "Click 'Remove' to delete your session.",
             reply_markup=InlineKeyboardMarkup(buttons)
         )
 
     elif data.startswith("remove_acc_"):
         phone = data.replace("remove_acc_", "")
-        if phone in user_sessions:
-            del user_sessions[phone]
+        if user_id in user_sessions and phone in user_sessions[user_id]:
+            del user_sessions[user_id][phone]
             await callback.answer(f"Account {phone} removed successfully!", show_alert=True)
         else:
             await callback.answer("Account not found.", show_alert=True)
@@ -149,11 +148,12 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
         await handle_callbacks(client, callback)
 
     # --------------------------------------------------------------
-    # BROADCAST WORKFLOW
+    # BROADCAST WORKFLOW (USER SPECIFIC ONLY)
     # --------------------------------------------------------------
     elif data == "broadcast_menu":
-        if not user_sessions:
-            await callback.answer("⚠️ Please add at least one account session first!", show_alert=True)
+        my_accs = user_sessions.get(user_id, {})
+        if not my_accs:
+            await callback.answer("⚠️ Please add at least one account first!", show_alert=True)
             return
         
         await callback.message.edit_text(
@@ -173,24 +173,26 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
         }
         await callback.message.edit_text(
             f"🎯 **Target:** {target_map[data]}\n\n"
-            "❓ **Do you want to add a photo with text?**",
+            "❓ **Do you want to add a photo with your message?**",
             reply_markup=media_choice_keyboard()
         )
 
     elif data == "media_yes":
-        user_states[user_id]["has_photo"] = True
-        user_states[user_id]["step"] = "AWAITING_PHOTO"
-        await callback.message.edit_text("📸 Please send the **Photo** you want to attach to your promo message.")
+        if user_id in user_states:
+            user_states[user_id]["has_photo"] = True
+            user_states[user_id]["step"] = "AWAITING_PHOTO"
+            await callback.message.edit_text("📸 Send the **Photo** you want to attach.")
 
     elif data == "media_no":
-        user_states[user_id]["has_photo"] = False
-        user_states[user_id]["step"] = "AWAITING_TEXT"
-        await callback.message.edit_text("📝 Please send your **Promo Text Message** (Emojis & formatting supported).")
+        if user_id in user_states:
+            user_states[user_id]["has_photo"] = False
+            user_states[user_id]["step"] = "AWAITING_TEXT"
+            await callback.message.edit_text("📝 Send your **Promo Text Message** (Emojis & formatting supported).")
 
 # ------------------------------------------------------------------
-# TEXT / MEDIA CAPTURE HANDLER
+# INPUT CAPTURE HANDLER
 # ------------------------------------------------------------------
-@bot.on_message(filters.user(ADMIN_ID) & ~filters.command("start"))
+@bot.on_message(filters.private & ~filters.command("start"))
 async def handle_inputs(client: Client, message: Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
@@ -200,27 +202,30 @@ async def handle_inputs(client: Client, message: Message):
 
     step = state.get("step")
 
-    # Helper function to generate and send downloadable session document
+    # Helper function to assign session to specific user and send file
     async def complete_login_and_send_file(phone: str, session_string: str):
-        user_sessions[phone] = session_string
+        if user_id not in user_sessions:
+            user_sessions[user_id] = {}
+        
+        user_sessions[user_id][phone] = session_string
 
-        # Create downloadable file in memory
+        # Generate downloadable file
         file_bytes = BytesIO(session_string.encode("utf-8"))
-        file_bytes.name = f"{phone}_string.session"
+        file_bytes.name = f"{phone}_session.string"
 
         await message.reply_document(
             document=file_bytes,
             caption=(
-                f"✅ **Session Logged In Successfully!**\n\n"
+                f"✅ **Account Logged In Successfully!**\n\n"
                 f"📱 **Phone:** `{phone}`\n"
-                f"📂 **Session File:** Attached above. You can download and use this String Session anywhere.\n\n"
-                f"Account is now active under **My Accounts**."
+                f"📂 **Session File:** Attached above. You can download and save it.\n\n"
+                f"Your account is now ready to use under **My Accounts**."
             ),
             reply_markup=main_menu_keyboard()
         )
         user_states.pop(user_id, None)
 
-    # 1. Login Process: Phone Number
+    # 1. Add Phone
     if step == "AWAITING_PHONE":
         phone = message.text.strip()
         temp_client = Client("temp_session", api_id=API_ID, api_hash=API_HASH, in_memory=True)
@@ -233,13 +238,13 @@ async def handle_inputs(client: Client, message: Message):
                 "phone_code_hash": code_info.phone_code_hash,
                 "temp_client": temp_client
             })
-            await message.reply_text("📲 **OTP Sent!** Please reply with the login code (format: `1 2 3 4 5` or `12345`).")
+            await message.reply_text("📲 **OTP Sent!** Please enter the code (format: `12345` or `1 2 3 4 5`).")
         except Exception as e:
             await temp_client.disconnect()
-            await message.reply_text(f"❌ Failed to send code: `{str(e)}`", reply_markup=main_menu_keyboard())
+            await message.reply_text(f"❌ Failed to send OTP: `{str(e)}`", reply_markup=main_menu_keyboard())
             user_states.pop(user_id, None)
 
-    # 2. Login Process: OTP Code
+    # 2. Add OTP Code
     elif step == "AWAITING_OTP":
         otp = message.text.replace(" ", "").strip()
         temp_client = state["temp_client"]
@@ -255,17 +260,17 @@ async def handle_inputs(client: Client, message: Message):
 
         except SessionPasswordNeeded:
             user_states[user_id]["step"] = "AWAITING_2FA"
-            await message.reply_text("🔐 This account has **Two-Step Verification (2FA)** enabled. Please enter your password.")
+            await message.reply_text("🔐 **Two-Step Verification (2FA)** enabled. Enter your password.")
 
         except PhoneCodeInvalid:
-            await message.reply_text("❌ Invalid OTP code. Please try again.")
+            await message.reply_text("❌ Invalid OTP code. Please re-enter.")
 
         except Exception as e:
             await temp_client.disconnect()
             await message.reply_text(f"❌ Login failed: `{str(e)}`", reply_markup=main_menu_keyboard())
             user_states.pop(user_id, None)
 
-    # 3. Login Process: 2FA Password
+    # 3. Add 2FA Password
     elif step == "AWAITING_2FA":
         password = message.text.strip()
         temp_client = state["temp_client"]
@@ -286,7 +291,7 @@ async def handle_inputs(client: Client, message: Message):
             await message.reply_text(f"❌ Login failed: `{str(e)}`", reply_markup=main_menu_keyboard())
             user_states.pop(user_id, None)
 
-    # 4. Broadcast Process: Capture Photo
+    # 4. Capture Photo
     elif step == "AWAITING_PHOTO":
         if not message.photo:
             await message.reply_text("❌ Please send a valid **photo**.")
@@ -296,28 +301,30 @@ async def handle_inputs(client: Client, message: Message):
         user_states[user_id]["step"] = "AWAITING_TEXT"
         await message.reply_text("📝 Photo saved! Now send your **Promo Text Message / Caption**.")
 
-    # 5. Broadcast Process: Capture Text & Execute
+    # 5. Capture Text & Execute Broadcast
     elif step == "AWAITING_TEXT":
         promo_text = message.text or message.caption or ""
         target = state.get("target")
         photo_file_id = state.get("photo_file_id")
 
-        await message.reply_text("⏳ **Initiating Broadcast Engine across all added accounts...**")
+        await message.reply_text("⏳ **Starting Broadcast using YOUR connected accounts...**")
 
-        # Run Background Broadcast Task
-        asyncio.create_task(run_broadcast(
+        # Trigger background broadcast restricted to this user's sessions
+        asyncio.create_task(run_user_broadcast(
+            owner_id=user_id,
             target=target,
             text=promo_text,
             photo_file_id=photo_file_id
         ))
 
         user_states.pop(user_id, None)
-        await message.reply_text("🚀 **Broadcast started in background!** You will be notified when completed.", reply_markup=main_menu_keyboard())
+        await message.reply_text("🚀 **Broadcast started in background!** You will receive a summary when finished.", reply_markup=main_menu_keyboard())
 
 # ------------------------------------------------------------------
-# MULTI-ACCOUNT BROADCAST ENGINE
+# BROADCAST ENGINE (ISOLATED PER USER)
 # ------------------------------------------------------------------
-async def run_broadcast(target: str, text: str, photo_file_id: str = None):
+async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_id: str = None):
+    my_accounts = user_sessions.get(owner_id, {})
     total_sent = 0
     total_failed = 0
 
@@ -325,7 +332,7 @@ async def run_broadcast(target: str, text: str, photo_file_id: str = None):
     if photo_file_id:
         local_photo_path = await bot.download_media(photo_file_id)
 
-    for phone, session_str in user_sessions.items():
+    for phone, session_str in my_accounts.items():
         user_client = Client(f"user_{phone}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
 
         try:
@@ -350,23 +357,23 @@ async def run_broadcast(target: str, text: str, photo_file_id: str = None):
                             await user_client.send_message(dialog.chat.id, text=text)
                         
                         total_sent += 1
-                        await asyncio.sleep(2)  # Delay to avoid FloodWait limits
+                        await asyncio.sleep(2)  # Delay to avoid Telegram FloodWait
                     except FloodWait as e:
                         await asyncio.sleep(e.value)
                     except Exception as err:
-                        logger.error(f"Failed to send to {dialog.chat.id} via {phone}: {err}")
+                        logger.error(f"Error sending to {dialog.chat.id} via {phone}: {err}")
                         total_failed += 1
 
             await user_client.stop()
 
         except Exception as e:
-            logger.error(f"Account {phone} execution error: {e}")
+            logger.error(f"Execution error for account {phone}: {e}")
             total_failed += 1
 
-    # Send Completion Report
+    # Send report back only to the owner
     await bot.send_message(
-        ADMIN_ID,
-        f"📊 **Broadcast Completed Summary**\n\n"
+        owner_id,
+        f"📊 **Broadcast Complete Summary**\n\n"
         f"✅ **Messages Sent:** `{total_sent}`\n"
         f"❌ **Failed Attempts:** `{total_failed}`",
         reply_markup=main_menu_keyboard()
@@ -376,5 +383,5 @@ async def run_broadcast(target: str, text: str, photo_file_id: str = None):
 # ENTRY POINT
 # ------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("Starting Railway Promo Bot Engine...")
+    logger.info("Starting Multi-Tenant Public Promo Bot...")
     bot.run()
