@@ -1,26 +1,17 @@
 #!/usr/bin/env python3
 """
-🤖 TELEGRAM PROMO BOT v2.2
---------------------------
+🤖 TELEGRAM PROMO BOT v2.2 (FIXED EDITION)
+------------------------------------------
 + Full English quote support (never truncated)
 + 🖼️ Photo: custom image upload or auto-generated image
 + 🎨 Auto Image: message text -> stylish image (same font, emoji rendered properly)
 + ⏰ Two time modes: One-Time schedule OR 🔁 Loop Mode (repeat every X minutes)
 + 🌐 Promo My GCs: send to ALL groups where the account is already a member (auto-discover)
-+ ✉️ NEW: Promo My DMs — send to ALL private chats of the account (auto-discover)
-+ 💬 NEW: Promo DM + GC — DMs + groups dono ek hi run me
-+ 🔄 NEW: STOP/DONE ke baad Restart + Main Menu buttons (wahi scope wapas chalta hai)
-+ ⏰ FIXED: time parsing — 13:40 / 1340 / 13 40 / 13.40 sab time samjha jata hai;
-     agar time nikal gaya to kal ka wait nahi — START dabate hi turant run hota hai
-+ 🔧 PEER ID FIX: warm_peers() — promo client ka access_hash cache bhar deta hai.
-     Bot client ko touch nahi karta → commands 100% normal. NO no_updates.
-+ 🔐 Per-user data: every Telegram user sees ONLY their own accounts/groups (private)
-+ 🔑 session_<phone>.txt is sent after login — reuse the session anywhere
-+ All previous features: accounts/sessions, GCs, time, status, start/stop
-
-Install: pip install pyrogram tgcrypto pillow pilmoji requests python-dotenv
-Font:    put any .ttf (Poppins/Montserrat) in the bot folder,
-         otherwise the default DejaVu font is used
++ ✉️ Promo My DMs: send to ALL private chats of the account (auto-discover)
++ 💬 Promo DM + GC: DMs + groups dono ek hi run me
++ 🔄 STOP/DONE ke baad Restart + Main Menu buttons
++ ⏰ Smart time parsing (13:40 / 1340 / 13 40 / 13.40)
++ 🔧 PEER ID FIX & Smooth Discovery (No message spam rate-limits)
 """
 
 import asyncio
@@ -107,9 +98,6 @@ async def deliver_session(message, phone, session):
         pass
 
 # ===================== DATA STORE (per-user) =====================
-# Har Telegram user ka apna data file: data_<user_id>.json
-# => kisi aur user ko tumhare accounts/groups kabhi nahi dikhte (full privacy)
-
 def data_path(uid):
     return f"data_{uid}.json"
 
@@ -144,7 +132,6 @@ def find_font():
     return None
 
 def wrap_text(text, font, max_width):
-    """Wraps words and preserves newlines — the full quote is never cut off."""
     lines = []
     for para in text.split("\n"):
         words = para.split()
@@ -169,7 +156,6 @@ def pick_font_size(text_len):
     return 46
 
 def generate_promo_image(text, font_path=None):
-    """Converts the message into a proper image (with emoji support)."""
     fp = font_path or find_font()
     if not fp:
         raise FileNotFoundError("No font found! Put a .ttf font file in the bot folder.")
@@ -185,18 +171,15 @@ def generate_promo_image(text, font_path=None):
     img = Image.new("RGB", (IMG_WIDTH, height), IMG_BG)
     draw = ImageDraw.Draw(img)
 
-    # top accent bar + big quote mark
     draw.rectangle([0, 0, IMG_WIDTH, 10], fill=IMG_ACCENT)
     q_font = ImageFont.truetype(fp, 90)
     draw.text((pad, pad - 55), "\u201C", font=q_font, fill=IMG_ACCENT)
 
-    # main text — Pilmoji renders emoji (Twemoji) properly
     with Pilmoji(img) as pmj:
         pmj.text((pad, pad + 20), "\n".join(lines), font=font,
                  fill=IMG_FG, spacing=12,
                  emoji_scale_factor=1.25, emoji_position_offset=(0, 4))
 
-    # footer line
     draw.rectangle([pad, height - 60, IMG_WIDTH - pad, height - 56], fill=IMG_ACCENT)
     return img
 
@@ -263,7 +246,6 @@ def groups_kb(data):
     return InlineKeyboardMarkup(kb)
 
 def normalize_phone(raw):
-    """Returns international format like +919876543210 or None."""
     t = raw.strip().replace(" ", "")
     if not t.startswith("+"):
         t = "+" + t
@@ -273,52 +255,37 @@ def normalize_phone(raw):
 
 def parse_group(raw):
     t = raw.strip()
-    # invite link: https://t.me/+xyz or t.me/+xyz
     m = re.search(r"t\.me/\+([A-Za-z0-9_\-]+)", t)
     if m:
         return {"type": "invite", "value": m.group(1), "raw": t, "ids": {}}
-    # username: https://t.me/name / t.me/name / @name
     m = re.search(r"t\.me/([A-Za-z0-9_]{5,})", t)
     if m:
         return {"type": "username", "value": m.group(1), "raw": t, "ids": {}}
     m = re.fullmatch(r"@([A-Za-z0-9_]{5,})", t)
     if m:
         return {"type": "username", "value": m.group(1), "raw": t, "ids": {}}
-    # numeric ID
     m = re.fullmatch(r"(-?\d{9,15})", t)
     if m:
         return {"type": "id", "value": int(t), "raw": t, "ids": {}}
     return None
 
 def parse_time_input(raw):
-    """⏰ FIX — time input ab smart hai:
-    '13:40' / '13 40' / '13.40' / '1340' → (clock, 13, 40)
-    '5' / '90' → (minutes, N) — N minute baad
-    Pehle '13 40' → '1340' → 1340 MINUTES (= 22 ghante!) samajh leta tha — isliye
-    time laga hi nahi tha. Ab sab sahi parse hota hai."""
     t = raw.strip().replace(" ", "").replace(".", ":")
-    # 13:40 style
     m = re.fullmatch(r"(\d{1,2}):(\d{1,2})", t)
     if m:
         hh, mm = int(m.group(1)), int(m.group(2))
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return ("clock", hh, mm)
-    # 1340 style (4 digit)
     m = re.fullmatch(r"(\d{4})", t)
     if m:
         hh, mm = int(t[:2]), int(t[2:])
         if 0 <= hh <= 23 and 0 <= mm <= 59:
             return ("clock", hh, mm)
-    # pure number = minutes from now
     if re.fullmatch(r"\d+", t):
         return ("minutes", 0, int(t))
     return None
 
 def compute_target(time_str):
-    """Returns the datetime when the promo should run.
-    Clock time (13:40) → aaj us time pe; agar wo time nikal gaya hai to
-    kal ka wait nahi — turant run hota hai (catch-up).
-    Pure number (5) → 5 minute baad."""
     parsed = parse_time_input(time_str)
     if parsed is None:
         raise ValueError("invalid time format")
@@ -326,7 +293,7 @@ def compute_target(time_str):
     if kind == "clock":
         now = datetime.now()
         target = now.replace(hour=a, minute=b, second=0, microsecond=0)
-        return target   # passed ho to past me hai → run_promo turant chala dega
+        return target
     return datetime.now() + timedelta(minutes=b)
 
 def split_text(text, limit=4000):
@@ -357,7 +324,6 @@ def build_status(d):
     return "\n".join(lines)
 
 def promo_missing(d, scope="saved"):
-    """Promo start karne ke liye kya-kya missing hai — list return karta hai."""
     missing = []
     if not d["accounts"]: missing.append("accounts")
     if scope == "saved" and not d["groups"]: missing.append("groups")
@@ -373,173 +339,69 @@ def promo_missing(d, scope="saved"):
 
 # ===================== GROUP LOGIC =====================
 async def warm_peers(user, limit=1000):
-    """
-    Load Telegram dialogs into the current user client.
-
-    This is read-only.
-    It is used to verify that the logged-in account can actually
-    retrieve its Telegram dialogs and their peer information.
-    """
-
     count = 0
-
-    print("\n" + "=" * 60)
-    print(f"[PEER] Warming peers for: {user.name}")
-    print("=" * 60)
-
     try:
         async for dialog in user.get_dialogs(limit=limit):
-
             count += 1
-            chat = dialog.chat
-
-            chat_type = str(chat.type)
-            chat_id = getattr(chat, "id", None)
-            title = getattr(chat, "title", None)
-            username = getattr(chat, "username", None)
-
-            print(
-                f"[PEER] #{count} | "
-                f"type={chat_type} | "
-                f"id={chat_id} | "
-                f"title={title!r} | "
-                f"username={username!r}"
-            )
-
-        print("=" * 60)
-        print(
-            f"[PEER] DONE | "
-            f"account={user.name} | "
-            f"dialogs={count}"
-        )
-        print("=" * 60)
-
-        return count
-
     except Exception as e:
-
-        print("=" * 60)
-        print(
-            f"[PEER][ERROR] "
-            f"{type(e).__name__}: {e}"
-        )
-        print("=" * 60)
-
-        return 0
-
+        print(f"[PEER ERROR] {e}")
+    return count
 
 async def discover_groups(user, limit=1000):
-    """
-    Read-only discovery of groups/supergroups
-    from the logged-in account's dialogs.
-    """
-
     found = []
-
-    print("\n" + "=" * 60)
-    print(f"[DISCOVERY][GC] START | {user.name}")
-    print("=" * 60)
-
     try:
-
         async for dialog in user.get_dialogs(limit=limit):
-
-            chat = dialog.chat
-
-            print(
-                f"[DISCOVERY][GC] CHECK | "
-                f"type={chat.type} | "
-                f"id={chat.id} | "
-                f"title={getattr(chat, 'title', None)!r}"
-            )
-
-            if chat.type in (
-                ChatType.GROUP,
-                ChatType.SUPERGROUP
-            ):
-                found.append(chat)
-
-        print("=" * 60)
-        print(
-            f"[DISCOVERY][GC] COMPLETE | "
-            f"account={user.name} | "
-            f"groups={len(found)}"
-        )
-
-        for index, chat in enumerate(found, 1):
-            print(
-                f"[DISCOVERY][GC] "
-                f"{index}. "
-                f"{getattr(chat, 'title', None)!r} "
-                f"| id={chat.id}"
-            )
-
-        print("=" * 60)
-
+            try:
+                chat = dialog.chat
+                if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+                    found.append(chat)
+            except Exception:
+                continue
     except Exception as e:
-
-        print("=" * 60)
-        print(
-            f"[DISCOVERY][GC][ERROR] "
-            f"{type(e).__name__}: {e}"
-        )
-        print("=" * 60)
-
+        print(f"[DISCOVERY GC ERROR] {e}")
     return found
 
-async def discover_dms(user, limit=500):
-    """All PRIVATE chats (users) the account has a dialog with."""
+async def discover_dms(user, limit=1000):
     found = []
     try:
         me = (await user.get_me()).id
         async for dialog in user.get_dialogs(limit=limit):
-            c = dialog.chat
-            if c.type == ChatType.PRIVATE and c.id != me:
-                found.append(c)
-    except Exception:
-        pass
+            try:
+                c = dialog.chat
+                if c.type == ChatType.PRIVATE and c.id != me:
+                    found.append(c)
+            except Exception:
+                continue
+    except Exception as e:
+        print(f"[DISCOVERY DM ERROR] {e}")
     return found
 
-
-async def discover_all(user, limit=500):
+async def discover_all(user, limit=1000):
     found = []
-
     try:
-        me = await user.get_me()
-
+        me = (await user.get_me()).id
         async for dialog in user.get_dialogs(limit=limit):
-            chat = dialog.chat
-
-            if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-                found.append(chat)
-
-            elif chat.type == ChatType.PRIVATE and chat.id != me.id:
-                found.append(chat)
-
-        print(
-            f"[DISCOVERY][DM+GC] {user.name}: "
-            f"{len(found)} total chats found"
-        )
-
+            try:
+                chat = dialog.chat
+                if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+                    found.append(chat)
+                elif chat.type == ChatType.PRIVATE and chat.id != me:
+                    found.append(chat)
+            except Exception:
+                continue
     except Exception as e:
-        print(
-            f"[DISCOVERY][DM+GC][ERROR] {user.name}: "
-            f"{type(e).__name__}: {e}"
-        )
-
+        print(f"[DISCOVERY DM+GC ERROR] {e}")
     return found
 
 def scope_entries(scope, chats):
-    """Discovered chats ko entry list me convert karta hai (send ke liye)."""
     if scope == "all_gc":
         return [{"type": "dialog", "chat": c,
                  "raw": f"{c.title or c.id} ({c.id})"} for c in chats]
     if scope == "dm":
         return [{"type": "dialog", "chat": c,
-                 "raw": f"{c.first_name or c.id} ({c.id})"} for c in chats]
-    # dm_gc
+                 "raw": f"{getattr(c, 'first_name', '') or c.id} ({c.id})"} for c in chats]
     return [{"type": "dialog", "chat": c,
-             "raw": f"{(c.title or c.first_name or c.id)} ({c.id})"} for c in chats]
+             "raw": f"{(getattr(c, 'title', None) or getattr(c, 'first_name', None) or c.id)} ({c.id})"} for c in chats]
 
 async def add_group_entry(entry, chat_id):
     d = load_data(chat_id)
@@ -569,9 +431,7 @@ async def add_group_entry(entry, chat_id):
     save_data(d, chat_id)
 
 async def resolve_chat_id(user, entry, acc_name):
-    """Resolves the group chat ID (joins via username/invite if needed)."""
     if entry["type"] == "dialog":
-        # from 🌐 Promo My GCs / DMs — account is already a member, cache is warm
         return entry["chat"].id, None
     if entry["type"] == "id":
         try:
@@ -582,11 +442,8 @@ async def resolve_chat_id(user, entry, acc_name):
             try:
                 chat = await user.get_chat(entry["value"])
                 return chat.id, None
-            except Exception as e:
-                return None, (f"account cannot access chat {entry['value']} — "
-                              f"the account is NOT a member of this chat, or the ID is wrong. "
-                              f"Add this group via its invite link instead "
-                              f"(accounts auto-join and it works).")
+            except Exception:
+                return None, f"account cannot access chat {entry['value']}"
     if entry["type"] == "username":
         try:
             await user.join_chat(entry["value"])
@@ -598,20 +455,19 @@ async def resolve_chat_id(user, entry, acc_name):
             return (await user.get_chat(entry["value"])).id, None
         except Exception as e:
             return None, f"get_chat failed: {e}"
-    # invite link
+    
     chat_id = entry["ids"].get(acc_name)
     if chat_id is not None:
         try:
             await user.get_chat(chat_id)
             return chat_id, None
         except Exception:
-            pass  # cached ID doesn't resolve in a fresh client → re-join
+            pass
     try:
         chat = await user.join_chat(f"https://t.me/+{entry['value']}")
         entry["ids"][acc_name] = chat.id
         return chat.id, None
     except UserAlreadyParticipant:
-        # already a member but peer cache is empty → pull dialogs to get access_hash
         await warm_peers(user)
         cid = entry["ids"].get(acc_name)
         if cid is not None:
@@ -620,50 +476,39 @@ async def resolve_chat_id(user, entry, acc_name):
                 return cid, None
             except Exception:
                 pass
-        return None, ("already a member, but the chat ID could not be resolved — "
-                      "remove this group and add it again using the invite link")
+        return None, "Chat ID could not be resolved"
     except Exception as e:
         return None, f"join failed: {e}"
 
 async def send_payload(user, chat_id, d, stop_event, force_text=False):
-    """
-    Sends photo (if set) + full message. The message is never truncated.
-    force_text=True → groups added by chat ID get TEXT ONLY (no photo).
-    If the photo fails for any reason → automatic fallback to text-only.
-    """
     text = d["message"]
     photo = d.get("photo", "") or ""
     auto = d.get("auto_image", True)
 
     if force_text:
-        # group was added by raw chat ID → no photo, text only
         remaining = split_text(text)
     else:
-        # ---- Try photo ----
         if photo and os.path.exists(photo):
-            caption = text[:1024]            # caption limit is 1024 chars
+            caption = text[:1024]
             rest = text[1024:]
             try:
                 await user.send_photo(chat_id, photo, caption=caption)
                 remaining = split_text(rest) if rest else []
             except Exception:
-                # photo failed (e.g. Peer id invalid) → fall back to plain text
                 remaining = split_text(text)
         elif auto:
             try:
                 img_path = generate_image_file(text)
                 try:
-                    await user.send_photo(chat_id, img_path)   # full quote inside the image
+                    await user.send_photo(chat_id, img_path)
                     remaining = split_text(text) if AUTO_SEND_TEXT else []
                 except Exception:
-                    # photo failed → fall back to plain text
                     remaining = split_text(text)
             except Exception:
-                remaining = split_text(text)   # if the image fails, send text only
+                remaining = split_text(text)
         else:
             remaining = split_text(text)
 
-    # ---- Send remaining text chunks ----
     for chunk in remaining:
         if stop_event.is_set():
             return "stopped"
@@ -683,7 +528,7 @@ async def send_to_group(user, entry, acc_name, d, stop_event):
     chat_id, err = await resolve_chat_id(user, entry, acc_name)
     if err:
         return f"❌ {err}"
-    force_text = (entry["type"] == "id")   # chat-ID groups: text only, no photo
+    force_text = (entry["type"] == "id")
     try:
         res = await send_payload(user, chat_id, d, stop_event, force_text=force_text)
         return "✅" if res == "✅" else f"❌ {res}"
@@ -694,7 +539,6 @@ async def send_to_group(user, entry, acc_name, d, stop_event):
 
 # ===================== PROMO RUNNER =====================
 async def run_promo(chat_id, progress_msg_id, scope="saved"):
-    """scope: 'saved' (📋 saved groups) / 'all_gc' / 'dm' / 'dm_gc'"""
     d = load_data(chat_id)
     accounts, groups = d["accounts"], d["groups"]
     time_str = d["time"]
@@ -703,7 +547,7 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
 
     ev = asyncio.Event()
     promo_state[chat_id] = ev
-    promo_scope[chat_id] = scope          # 🔄 Restart wahi scope pe chale
+    promo_scope[chat_id] = scope
     d["running"] = True
     save_data(d, chat_id)
 
@@ -713,7 +557,7 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
     results = []
     try:
         if mode == "loop":
-            wait_until = datetime.now()   # loop = turant start
+            wait_until = datetime.now()
             await bot.edit_message_text(
                 chat_id, progress_msg_id,
                 f"🔁 **PROMO STARTING — {scope_name} (LOOP MODE)**\n\n"
@@ -727,7 +571,7 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
             try:
                 wait_until = compute_target(time_str)
             except Exception:
-                wait_until = datetime.now()   # fallback: turant run
+                wait_until = datetime.now()
             delta = (wait_until - datetime.now()).total_seconds()
             if delta > 0:
                 await bot.edit_message_text(
@@ -741,7 +585,6 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
 
         run_number = 0
         while True:
-            # ---- wait in small chunks (STOP turant respond kare) ----
             while datetime.now() < wait_until:
                 if ev.is_set():
                     break
@@ -757,7 +600,7 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
                     break
                 await bot.edit_message_text(
                     chat_id, progress_msg_id,
-                    f"⏳ **Run #{run_number}** — {acc['name']} → sending... ({i}/{len(accounts)})",
+                    f"⏳ **Run #{run_number}** — {acc['name']} → starting process... ({i}/{len(accounts)})",
                     reply_markup=stop_kb(),
                 )
                 ok = fail = 0
@@ -765,165 +608,34 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
                 try:
                     async with Client(f"pr_{chat_id}_{i}", API_ID, API_HASH,
                                       session_string=acc["session"], in_memory=True) as user:
-                        await warm_peers(user)   # ⚠️ PEER ID FIX: cache bharo (bot ko touch nahi karta)
+                        
+                        # --- CLEANED & RELIABLE DISCOVERY BLOCK ---
                         if scope != "saved":
+                            await bot.edit_message_text(
+                                chat_id, progress_msg_id,
+                                f"🔎 **DISCOVERING CHATS ({scope_name})**\n\n"
+                                f"👤 Account: `{acc['name']}`\n"
+                                f"📡 Reading Telegram dialogs, please wait...",
+                                reply_markup=stop_kb(),
+                            )
+                            
+                            chats = []
+                            if scope == "all_gc":
+                                chats = await discover_groups(user, limit=1000)
+                            elif scope == "dm":
+                                chats = await discover_dms(user, limit=1000)
+                            elif scope == "dm_gc":
+                                chats = await discover_all(user, limit=1000)
+                                
+                            entries = scope_entries(scope, chats)
+                            
+                            await bot.edit_message_text(
+                                chat_id, progress_msg_id,
+                                f"⚡ **DISCOVERY DONE** — Found `{len(entries)}` targets.\n"
+                                f"👤 Sending messages via `{acc['name']}`...",
+                                reply_markup=stop_kb(),
+                            )
 
-                             # ---------------------------------------------------------
-                             # DISCOVERY START
-                             # ---------------------------------------------------------
-
-                             await bot.edit_message_text(
-                                 chat_id,
-                                 progress_msg_id,
-                                 f"🔎 **DISCOVERY STARTED**\n\n"
-                                 f"👤 Account: `{acc['name']}`\n"
-                                 f"📡 Reading Telegram dialogs...\n\n"
-                                 f"Please wait...",
-                                 reply_markup=stop_kb(),
-                             )
-
-                             print("\n" + "#" * 70)
-                             print(f"# DISCOVERY START")
-                             print(f"# ACCOUNT: {acc['name']}")
-                             print("#" * 70)
-
-                             # First load the account's dialogs.
-                             dialog_count = await warm_peers(
-                                 user,
-                                 limit=1000
-                             )
-
-                             print(
-                                 f"[DISCOVERY] Dialogs loaded: {dialog_count}"
-                             )
-
-                             # ---------------------------------------------------------
-                             # GROUP DISCOVERY
-                             # ---------------------------------------------------------
-
-                             if scope == "all_gc":
-
-                                 await bot.edit_message_text(
-                                     chat_id,
-                                     progress_msg_id,
-                                     f"🔎 **SCANNING GROUPS**\n\n"
-                                     f"👤 Account: `{acc['name']}`\n"
-                                     f"📂 Dialogs loaded: `{dialog_count}`\n\n"
-                                     f"Finding groups...",
-                                     reply_markup=stop_kb(),
-                                 )
-
-                                 chats = await discover_groups(
-                                     user,
-                                     limit=1000
-                                 )
-
-                                 label = "GCs"
-
-                             # ---------------------------------------------------------
-                             # DM DISCOVERY
-                             # ---------------------------------------------------------
-
-                             elif scope == "dm":
-
-                                 await bot.edit_message_text(
-                                     chat_id,
-                                     progress_msg_id,
-                                     f"🔎 **SCANNING PRIVATE CHATS**\n\n"
-                                     f"👤 Account: `{acc['name']}`\n"
-                                     f"📂 Dialogs loaded: `{dialog_count}`\n\n"
-                                     f"Reading private dialogs...",
-                                     reply_markup=stop_kb(),
-                                 )
-
-                                 chats = await discover_dms(
-                                     user,
-                                     limit=1000
-                                 )
-
-                                 label = "DMs"
-
-                             # ---------------------------------------------------------
-                             # DM + GC
-                             # ---------------------------------------------------------
-
-                             else:
-
-                                 await bot.edit_message_text(
-                                     chat_id,
-                                     progress_msg_id,
-                                     f"🔎 **SCANNING CHATS**\n\n"
-                                     f"👤 Account: `{acc['name']}`\n"
-                                     f"📂 Dialogs loaded: `{dialog_count}`\n\n"
-                                     f"Reading Telegram dialogs...",
-                                     reply_markup=stop_kb(),
-                                 )
-
-                                 chats = await discover_all(
-                                     user,
-                                     limit=1000
-                                 )
-
-                                 label = "DMs + GCs"
-
-                             # ---------------------------------------------------------
-                             # DISCOVERY RESULT
-                             # ---------------------------------------------------------
-
-                             entries = scope_entries(
-                                 scope,
-                                 chats
-                             )
-
-                             print("\n" + "#" * 70)
-                             print("# DISCOVERY RESULT")
-                             print(f"# ACCOUNT : {acc['name']}")
-                             print(f"# DIALOGS : {dialog_count}")
-                             print(f"# TARGETS : {len(chats)}")
-                             print("#" * 70)
-
-                             for index, chat in enumerate(chats, 1):
-
-                                 print(
-                                     f"[DISCOVERY RESULT] "
-                                     f"{index}. "
-                                     f"type={chat.type} | "
-                                     f"id={chat.id} | "
-                                     f"name={getattr(chat, 'title', None) or getattr(chat, 'first_name', None)!r}"
-                                 )
-
-                             print("#" * 70)
-
-                             # ---------------------------------------------------------
-                             # SHOW RESULT IN TELEGRAM BOT
-                             # ---------------------------------------------------------
-
-                             if len(chats) == 0:
-
-                                 result_text = (
-                                     f"⚠️ **DISCOVERY COMPLETE**\n\n"
-                                     f"👤 Account: `{acc['name']}`\n"
-                                     f"📂 Dialogs loaded: `{dialog_count}`\n"
-                                     f"📊 {label} found: `0`\n\n"
-                                     f"❗ Telegram returned no matching chats."
-                                 )
-
-                             else:
-
-                                 result_text = (
-                                     f"✅ **DISCOVERY COMPLETE**\n\n"
-                                     f"👤 Account: `{acc['name']}`\n"
-                                     f"📂 Dialogs loaded: `{dialog_count}`\n"
-                                     f"📊 {label} found: `{len(chats)}`\n\n"
-                                     f"⚙️ Discovery is working."
-                                      )
-
-                             await bot.edit_message_text(
-                                 chat_id,
-                                 progress_msg_id,
-                                 result_text,
-                                 reply_markup=stop_kb(),
-                             )
                         for entry in entries:
                             res = await send_to_group(user, entry, acc["name"], d, ev)
                             if res == "✅":
@@ -936,11 +648,11 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
                 except Exception as e:
                     fail += 1
                     results.append(f"❌ {acc['name']}: {e}")
+                
                 extra = f" ({len(entries)} targets)" if scope != "saved" else ""
                 results.append(f"{'✅' if fail == 0 else '⚠️'} {acc['name']}: {ok} ok / {fail} fail{extra}")
                 await asyncio.sleep(DELAY_BETWEEN_ACCOUNTS)
 
-            # ---- run khatam hone ke baad ----
             if mode == "loop" and not ev.is_set():
                 next_run = datetime.now() + timedelta(minutes=interval)
                 await bot.edit_message_text(
@@ -952,7 +664,6 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
                 )
                 wait_until = next_run
             else:
-                # one-time mode: finished
                 await bot.edit_message_text(
                     chat_id, progress_msg_id,
                     f"🏁 **PROMO DONE — {scope_name}**\n\n" + "\n".join(results),
@@ -960,7 +671,6 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
                 )
                 break
 
-        # stopped mid-run (during wait or sending)
         if ev.is_set():
             txt = "🛑 **PROMO STOPPED**"
             if results:
@@ -989,61 +699,17 @@ async def help_cmd(client, message: Message):
     text = """📖 **STEP-BY-STEP GUIDE**
 
 **1️⃣ ADD ACCOUNTS**
-• Tap ➕ Add Account
-• Send your phone number in international format — `+919876543210`
-• Send the OTP you receive (enter the 2FA password if enabled)
-• Session saved ✅ — add as many accounts as you want
-• You also receive your **session_<phone>.txt** — reuse it anywhere
-• To remove one, tap 👥 My Accounts → ❌
+• Tap ➕ Add Account & follow prompt
 
-**2️⃣ ADD GROUPS (GC)**
-• Tap ➕ Add Group
-• Send: username `@testgroup` / invite link `t.me/+xyz` / ID `-100123456789`
-• Accounts auto-join via the invite link
-• To remove one, tap 📋 My Groups → ❌
+**2️⃣ ADD GROUPS / DISCOVER ALL**
+• Add groups manually or tap 🌐 **Promo My GCs** / ✉️ **Promo My DMs** / 💬 **Promo DM + GC**
 
-**3️⃣ CUSTOM MESSAGE**
-• Tap ✏️ Custom Message → send your English quote
-• Any length — always sent in full, never truncated
+**3️⃣ CUSTOM MESSAGE & PHOTO**
+• Save your quote message and optionally set a custom promo photo.
 
-**4️⃣ PROMO PHOTO (optional)**
-• Tap 🖼️ Promo Photo
-• **Send Photo** → upload your own image (your message goes as caption)
-• **Auto Generate** → a stylish image is created from your message
-   — same font, emojis rendered properly 🎨
-• If no photo is set, auto-generate is the default
-
-**5️⃣ SET TIME — choose a mode**
-• Tap ⏰ Set Time → pick one:
-• 🕐 **One-Time** — `5` = 5 minutes from now | `13:40` = today at 13:40
-   — agar 13:40 nikal gaya hai to START dabate hi turant run hota hai
-   (13:40 / 1340 / 13 40 / 13.40 — sab chalega)
-• 🔁 **Loop Mode** — send interval in minutes (`10`, `30`, `60`...)
-   — promo runs NOW, then repeats every X minutes until you tap 🛑
-
-**6️⃣ START**
-• Tap 🚀 START PROMO — sends photo + message to all saved groups from all accounts 🚀
-
-**7️⃣ PROMO MY GCS**
-• Tap 🌐 Promo My GCs — bot scans ALL groups where your accounts are
-  already members and sends the promo to every one of them
-  (no need to add groups one by one)
-
-**8️⃣ DMS / DM + GC (NEW)**
-• ✉️ Promo My DMs — sends to ALL private chats of your accounts
-• 💬 Promo DM + GC — sends to DMs + groups in one run
-
-**9️⃣ RESTART (NEW)**
-• Promo stop/done hone ke baad 🔄 Restart Promo button — wahi scope
-  (saved / all GCs / DMs / DM+GC) wapas chala deta hai
-
-**🔐 PRIVACY**
-• Every user sees ONLY their own data — accounts, groups, everything is private.
-
-**⚠️ NOTE:** Sending too fast may get your Telegram account **banned**.
-Delays are set (3s msgs / 10s accounts) — change them at the top of the code.
-
-/cancel — cancel any current step"""
+**4️⃣ SET TIME & START**
+• Select time mode and hit 🚀 **START PROMO**.
+"""
     await message.reply_text(text)
 
 @bot.on_message(filters.command("cancel") & filters.private)
@@ -1062,9 +728,7 @@ async def on_cb(client, cb: CallbackQuery):
     if data == "add_acc":
         user_state[chat_id] = {"step": "phone"}
         await cb.message.edit_text(
-            "📱 **ADD ACCOUNT**\n\n"
-            "Send your phone number in **international format**:\n`+919876543210`\n\n"
-            "Cancel: /cancel",
+            "📱 **ADD ACCOUNT**\n\nSend your phone number in **international format**:\n`+919876543210`\n\nCancel: /cancel",
             reply_markup=back_kb(),
         )
         await cb.answer(); return
@@ -1091,9 +755,7 @@ async def on_cb(client, cb: CallbackQuery):
     if data == "add_gc":
         user_state[chat_id] = {"step": "gc"}
         await cb.message.edit_text(
-            "➕ **ADD GROUP (GC)**\n\n"
-            "Send:\n• `https://t.me/+xyz` (invite link)\n• `@groupusername`\n• `-100123456789` (ID)\n\n"
-            "Accounts will auto-join via the invite link.",
+            "➕ **ADD GROUP (GC)**\n\nSend link / username / ID:",
             reply_markup=back_kb(),
         )
         await cb.answer(); return
@@ -1119,76 +781,43 @@ async def on_cb(client, cb: CallbackQuery):
 
     if data == "set_msg":
         user_state[chat_id] = {"step": "msg"}
-        await cb.message.edit_text(
-            "✏️ **CUSTOM MESSAGE**\n\n"
-            "Send your **English quote** — any length, rendered in full 📝\n\n"
-            "Cancel: /cancel",
-            reply_markup=back_kb(),
-        )
+        await cb.message.edit_text("✏️ **CUSTOM MESSAGE**\n\nSend your message text:", reply_markup=back_kb())
         await cb.answer(); return
 
     if data == "photo_menu":
-        await cb.message.edit_text(
-            "🖼️ **PROMO PHOTO**\n\n"
-            "• **Send Photo** — upload your own image (caption = your message)\n"
-            "• **Auto Generate** — image created automatically from your message (emoji rendered properly 🎨)",
-            reply_markup=photo_kb(d),
-        )
+        await cb.message.edit_text("🖼️ **PROMO PHOTO**", reply_markup=photo_kb(d))
         await cb.answer(); return
 
     if data == "photo_send":
         user_state[chat_id] = {"step": "photo"}
-        await cb.message.edit_text(
-            "🖼️ Now send your **photo** (no caption needed — your message is already saved)\n\n"
-            "Cancel: /cancel",
-            reply_markup=back_kb(),
-        )
+        await cb.message.edit_text("🖼️ Send your photo now:", reply_markup=back_kb())
         await cb.answer(); return
 
     if data == "photo_rm":
         d["photo"] = ""
         save_data(d, chat_id)
         await cb.answer("❌ Photo removed", show_alert=True)
-        await cb.message.edit_text("🖼️ **PROMO PHOTO** — photo removed. Auto-generate is active again.",
-                                   reply_markup=photo_kb(d))
+        await cb.message.edit_text("🖼️ Photo removed.", reply_markup=photo_kb(d))
         return
 
     if data == "set_time":
-        await cb.message.edit_text(
-            "⏰ **SET TIME — choose a mode**\n\n"
-            "🕐 **One-Time** — runs once at a scheduled time\n"
-            "🔁 **Loop Mode** — keeps sending every X minutes until you tap 🛑",
-            reply_markup=time_kb(),
-        )
+        await cb.message.edit_text("⏰ **SET TIME — choose a mode**", reply_markup=time_kb())
         await cb.answer(); return
 
     if data == "time_once":
         user_state[chat_id] = {"step": "time", "sub": "once"}
-        await cb.message.edit_text(
-            "🕐 **ONE-TIME SCHEDULE**\n\n"
-            "`5` = 5 minutes from now\n"
-            "`13:40` / `1340` / `13 40` = today at 13:40\n"
-            "(agar time nikal gaya to START dabate hi turant run hoga)\n\n"
-            "Cancel: /cancel",
-            reply_markup=back_kb(),
-        )
+        await cb.message.edit_text("🕐 Send time (e.g., `5` or `13:40`):", reply_markup=back_kb())
         await cb.answer(); return
 
     if data == "time_loop":
         user_state[chat_id] = {"step": "time", "sub": "loop"}
-        await cb.message.edit_text(
-            "🔁 **LOOP MODE**\n\n"
-            "Send the **interval in minutes** — the promo runs NOW and repeats every X minutes until you tap 🛑.\n\n"
-            "Examples: `10`, `30`, `60`, `1440`\n\nCancel: /cancel",
-            reply_markup=back_kb(),
-        )
+        await cb.message.edit_text("🔁 Send interval in minutes:", reply_markup=back_kb())
         await cb.answer(); return
 
     if data == "status":
         await cb.message.edit_text(build_status(d), reply_markup=main_kb())
         await cb.answer(); return
 
-    # ---- START PROMO (4 scope buttons: saved / all_gc / dm / dm_gc) ----
     if data in ("start_promo", "promo_all", "promo_dm", "promo_dm_gc"):
         scope = {"start_promo": "saved", "promo_all": "all_gc",
                  "promo_dm": "dm", "promo_dm_gc": "dm_gc"}[data]
@@ -1197,15 +826,11 @@ async def on_cb(client, cb: CallbackQuery):
             await cb.answer(f"❌ Set these first: {', '.join(missing)}", show_alert=True); return
         if promo_state.get(chat_id):
             await cb.answer("⏳ Promo already running!", show_alert=True); return
-        starts = {"saved": "🚀 **PROMO IS STARTING...**",
-                  "all_gc": "🌐 **SCANNING YOUR GROUPS...**",
-                  "dm": "✉️ **SCANNING YOUR DMs...**",
-                  "dm_gc": "💬 **SCANNING DMs + GROUPS...**"}
-        msg = await cb.message.edit_text(starts[scope])
+        
+        msg = await cb.message.edit_text("🚀 **INITIALIZING PROMO...**")
         asyncio.create_task(run_promo(chat_id, msg.id, scope))
         await cb.answer(); return
 
-    # ---- RESTART (stop ke baad wala button — wahi scope wapas) ----
     if data == "restart_promo":
         scope = promo_scope.get(chat_id) or "saved"
         missing = promo_missing(d, scope)
@@ -1232,7 +857,7 @@ async def on_cb(client, cb: CallbackQuery):
         await cb.message.edit_text("👋 Main menu:", reply_markup=main_kb())
         await cb.answer(); return
 
-# ===================== TEXT INPUT (FLOW STATE) =====================
+# ===================== TEXT INPUT =====================
 @bot.on_message(filters.text & filters.private)
 async def handle_text(client, message: Message):
     chat_id = message.chat.id
@@ -1251,15 +876,12 @@ async def handle_text(client, message: Message):
             temp = Client(f"tmp_{chat_id}", API_ID, API_HASH, in_memory=True)
             await temp.connect()
             sent = await temp.send_code(phone)
-        except FloodWait as e:
-            await message.reply_text(f"⚠️ FloodWait: {e.x} sec — try again later.")
-            return
         except Exception as e:
             user_state.pop(chat_id, None)
             await message.reply_text(f"❌ Error: {e}\n\nPress /start to try again.")
             return
         user_state[chat_id] = {"step": "code", "temp": temp, "phone": phone, "ph": sent.phone_code_hash}
-        await message.reply_text(f"📲 Enter the OTP sent to **{phone}**:", reply_markup=back_kb())
+        await message.reply_text(f"📲 Enter OTP sent to **{phone}**:", reply_markup=back_kb())
 
     elif st["step"] == "code":
         temp = st["temp"]
@@ -1269,69 +891,24 @@ async def handle_text(client, message: Message):
             await temp.sign_in(st["phone"], st["ph"], text)
         except SessionPasswordNeeded:
             user_state[chat_id]["step"] = "pass"
-            await message.reply_text(
-                "🔐 This account has **2FA password** enabled — send the password:",
-                reply_markup=back_kb(),
-            )
+            await message.reply_text("🔐 Enter 2FA Password:", reply_markup=back_kb())
             return
         except PhoneCodeInvalid:
-            # wrong code — same flow me retry, restart nahi karna padega
-            await message.reply_text(
-                "❌ Wrong code. Send the **correct code** again (no need to restart):"
-            )
-            return
-        except PhoneCodeExpired:
-            # old OTP expired — automatically request a new one
-            try:
-                sent = await temp.send_code(st["phone"])
-                user_state[chat_id]["ph"] = sent.phone_code_hash
-                await message.reply_text(
-                    "🔄 Old OTP expired. A **new OTP** has been sent — enter it:"
-                )
-            except FloodWait as e:
-                await message.reply_text(f"⚠️ FloodWait: {e.x} sec — wait and try again.")
-            except Exception as e:
-                await message.reply_text(f"❌ Could not send a new code: {e}\nPress /cancel and try again.")
-            return
-        except FloodWait as e:
-            await message.reply_text(f"⚠️ FloodWait: {e.x} sec — wait.")
+            await message.reply_text("❌ Wrong code. Try again:")
             return
         except Exception as e:
             await safe_stop(temp)
             user_state.pop(chat_id, None)
-            await message.reply_text(
-                f"❌ Error: {e}\n\nPress /start to try again.", reply_markup=main_kb()
-            )
+            await message.reply_text(f"❌ Error: {e}", reply_markup=main_kb())
             return
 
-        # ---- LOGIN SUCCESS ----
-        try:
-            session = await temp.export_session_string()
-        except Exception as e:
-            await safe_stop(temp)
-            user_state.pop(chat_id, None)
-            await message.reply_text(f"❌ Could not create session: {e}\n\nPress /start to try again.")
-            return
-
-        # ---- SAVE FIRST, stop after (so the session can never get lost) ----
+        session = await temp.export_session_string()
         d = load_data(chat_id)
-        if any(a["name"] == st["phone"] for a in d["accounts"]):
-            user_state.pop(chat_id, None)
-            await safe_stop(temp)
-            await message.reply_text(
-                f"⚠️ **{st['phone']}** is already added.", reply_markup=main_kb()
-            )
-            return
-        d["accounts"].append({"name": st["phone"], "session": session,
-                              "added": datetime.now().isoformat()})
+        d["accounts"].append({"name": st["phone"], "session": session, "added": datetime.now().isoformat()})
         save_data(d, chat_id)
         user_state.pop(chat_id, None)
         await safe_stop(temp)
-        await message.reply_text(
-            f"✅ **Account added!**\n\n📱 {st['phone']}\nTotal: {len(d['accounts'])} accounts\n\n"
-            f"Add more via ➕ Add Account, or continue with ➕ Add Group.",
-            reply_markup=main_kb()
-        )
+        await message.reply_text("✅ **Account added!**", reply_markup=main_kb())
         await deliver_session(message, st["phone"], session)
 
     elif st["step"] == "pass":
@@ -1340,115 +917,59 @@ async def handle_text(client, message: Message):
             if not temp.is_connected:
                 await temp.connect()
             await temp.check_password(text)
-        except PasswordHashInvalid:
-            await message.reply_text("❌ Wrong 2FA password. Send it again:")
-            return
-        except FloodWait as e:
-            await message.reply_text(f"⚠️ FloodWait: {e.x} sec — wait.")
-            return
         except Exception as e:
             await safe_stop(temp)
             user_state.pop(chat_id, None)
-            await message.reply_text(
-                f"❌ Error: {e}\n\nPress /start to try again.", reply_markup=main_kb()
-            )
+            await message.reply_text(f"❌ Error: {e}", reply_markup=main_kb())
             return
 
-        try:
-            session = await temp.export_session_string()
-        except Exception as e:
-            await safe_stop(temp)
-            user_state.pop(chat_id, None)
-            await message.reply_text(f"❌ Could not create session: {e}\n\nPress /start to try again.")
-            return
-
-        # ---- SAVE FIRST, stop after ----
+        session = await temp.export_session_string()
         d = load_data(chat_id)
-        if any(a["name"] == st["phone"] for a in d["accounts"]):
-            user_state.pop(chat_id, None)
-            await safe_stop(temp)
-            await message.reply_text(
-                f"⚠️ **{st['phone']}** is already added.", reply_markup=main_kb()
-            )
-            return
-        d["accounts"].append({"name": st["phone"], "session": session,
-                              "added": datetime.now().isoformat()})
+        d["accounts"].append({"name": st["phone"], "session": session, "added": datetime.now().isoformat()})
         save_data(d, chat_id)
         user_state.pop(chat_id, None)
         await safe_stop(temp)
-        await message.reply_text(
-            f"✅ **Account added!**\n\n📱 {st['phone']}\nTotal: {len(d['accounts'])} accounts\n\n"
-            f"Add more via ➕ Add Account, or continue with ➕ Add Group.",
-            reply_markup=main_kb()
-        )
+        await message.reply_text("✅ **Account added!**", reply_markup=main_kb())
         await deliver_session(message, st["phone"], session)
 
     elif st["step"] == "gc":
         entry = parse_group(text)
         if entry is None:
-            await message.reply_text("❌ Format not recognized. Send a link/username/ID, or /cancel.")
+            await message.reply_text("❌ Invalid format.")
             return
         user_state.pop(chat_id, None)
-        await message.reply_text("⏳ Adding group (accounts are joining via invite link)...")
         await add_group_entry(entry, chat_id)
-        d = load_data(chat_id)
-        await message.reply_text(
-            f"✅ **Group added!**\n\n{entry['raw']}\nTotal groups: {len(d['groups'])}",
-            reply_markup=main_kb()
-        )
+        await message.reply_text("✅ **Group added!**", reply_markup=main_kb())
 
     elif st["step"] == "msg":
         d = load_data(chat_id)
         d["message"] = message.text
         save_data(d, chat_id)
         user_state.pop(chat_id, None)
-        preview = message.text[:80] + ("..." if len(message.text) > 80 else "")
-        await message.reply_text(
-            f"✅ **Message saved!** ({len(message.text)} chars) — sent in full\n\nPreview:\n{preview}",
-            reply_markup=main_kb()
-        )
+        await message.reply_text("✅ **Message saved!**", reply_markup=main_kb())
 
     elif st["step"] == "time":
         t = text.replace(" ", "").replace(".", ":")
         sub = st.get("sub", "once")
         if sub == "loop":
-            # 🔁 Loop mode: interval in minutes
             try:
                 interval = int(t)
-                if interval < 1:
-                    raise ValueError
             except ValueError:
-                await message.reply_text("❌ Invalid interval. Send a number of **minutes**, e.g. `30`.")
+                await message.reply_text("❌ Send interval in minutes.")
                 return
             d = load_data(chat_id)
             d["mode"] = "loop"
             d["interval"] = interval
             save_data(d, chat_id)
             user_state.pop(chat_id, None)
-            await message.reply_text(
-                f"✅ **Loop Mode set!** 🔁\n\n"
-                f"The promo runs **now** and repeats **every {interval} minute(s)** "
-                f"until you tap 🛑 STOP PROMO.",
-                reply_markup=main_kb()
-            )
+            await message.reply_text("✅ **Loop Mode set!**", reply_markup=main_kb())
         else:
-            # 🕐 One-time schedule
-            try:
-                compute_target(t)
-            except Exception:
-                await message.reply_text(
-                    "❌ Invalid format. Send `5` (minutes) or `13:40` (time).")
-                return
             d = load_data(chat_id)
             d["mode"] = "once"
             d["time"] = t
             save_data(d, chat_id)
             user_state.pop(chat_id, None)
-            await message.reply_text(
-                f"✅ Time set: **{t}** (one-time)\n\n"
-                f"🕐 Agar ye time nikal gaya hai, to START dabate hi turant run hoga.",
-                reply_markup=main_kb()
-            )
+            await message.reply_text(f"✅ Time set: **{t}**", reply_markup=main_kb())
 
 # ===================== PHOTO UPLOAD =====================
 @bot.on_message(filters.photo & filters.private)
@@ -1456,28 +977,18 @@ async def handle_photo(client, message: Message):
     chat_id = message.chat.id
     st = user_state.get(chat_id)
     if not st or st["step"] != "photo":
-        return  # not in photo mode, ignore
-    await message.reply_text("⏳ Saving photo...")
+        return
     os.makedirs(PHOTO_DIR, exist_ok=True)
     path = await message.download(file_name=os.path.join(PHOTO_DIR, "promo_photo.jpg"))
-    if not path:
-        await message.reply_text("❌ Download failed. Try again.")
-        return
     d = load_data(chat_id)
     d["photo"] = path
     d["auto_image"] = False
     save_data(d, chat_id)
     user_state.pop(chat_id, None)
-    await message.reply_text(
-        "🖼️ **Photo set!** ✅\n\n"
-        "The promo will send the photo + your message (as caption).\n"
-        "Press /start and tap 🚀 START PROMO.",
-        reply_markup=main_kb()
-    )
+    await message.reply_text("🖼️ **Photo set!** ✅", reply_markup=main_kb())
 
 # ===================== MAIN =====================
 if __name__ == "__main__":
-    # reset stale running flags across ALL per-user data files
     for fname in os.listdir("."):
         if fname.startswith("data_") and fname.endswith(".json"):
             try:
