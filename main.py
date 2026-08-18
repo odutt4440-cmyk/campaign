@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """
-🤖 TELEGRAM PROMO BOT v2.1 — FINAL (Peer ID fix applied)
---------------------------------------------------------
+🤖 TELEGRAM PROMO BOT v2.2
+--------------------------
 + Full English quote support (never truncated)
 + 🖼️ Photo: custom image upload or auto-generated image
 + 🎨 Auto Image: message text -> stylish image (same font, emoji rendered properly)
 + ⏰ Two time modes: One-Time schedule OR 🔁 Loop Mode (repeat every X minutes)
 + 🌐 Promo My GCs: send to ALL groups where the account is already a member (auto-discover)
++ ✉️ NEW: Promo My DMs — send to ALL private chats of the account (auto-discover)
++ 💬 NEW: Promo DM + GC — DMs + groups dono ek hi run me
++ 🔄 NEW: STOP/DONE ke baad Restart + Main Menu buttons (wahi scope wapas chalta hai)
++ ⏰ FIXED: time parsing — 13:40 / 1340 / 13 40 / 13.40 sab time samjha jata hai;
+     agar time nikal gaya to kal ka wait nahi — START dabate hi turant run hota hai
 + 🔧 PEER ID FIX: warm_peers() — promo client ka access_hash cache bhar deta hai.
      Bot client ko touch nahi karta → commands 100% normal. NO no_updates.
 + 🔐 Per-user data: every Telegram user sees ONLY their own accounts/groups (private)
@@ -69,6 +74,7 @@ bot = Client("promo_manager", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TO
 
 user_state = {}
 promo_state = {}
+promo_scope = {}   # last scope remember karta hai (🔄 Restart ke liye)
 
 # ===================== SAFE CLIENT STOP =====================
 async def safe_stop(client):
@@ -214,6 +220,8 @@ def main_kb():
          InlineKeyboardButton("📊 Current Promo", callback_data="status")],
         [InlineKeyboardButton("🚀 START PROMO", callback_data="start_promo"),
          InlineKeyboardButton("🌐 Promo My GCs", callback_data="promo_all")],
+        [InlineKeyboardButton("✉️ Promo My DMs", callback_data="promo_dm"),
+         InlineKeyboardButton("💬 Promo DM + GC", callback_data="promo_dm_gc")],
     ])
 
 def back_kb():
@@ -221,6 +229,12 @@ def back_kb():
 
 def stop_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 STOP PROMO", callback_data="stop_promo")]])
+
+def restart_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Restart Promo", callback_data="restart_promo")],
+        [InlineKeyboardButton("📋 Main Menu", callback_data="back")],
+    ])
 
 def time_kb():
     return InlineKeyboardMarkup([
@@ -276,16 +290,44 @@ def parse_group(raw):
         return {"type": "id", "value": int(t), "raw": t, "ids": {}}
     return None
 
+def parse_time_input(raw):
+    """⏰ FIX — time input ab smart hai:
+    '13:40' / '13 40' / '13.40' / '1340' → (clock, 13, 40)
+    '5' / '90' → (minutes, N) — N minute baad
+    Pehle '13 40' → '1340' → 1340 MINUTES (= 22 ghante!) samajh leta tha — isliye
+    time laga hi nahi tha. Ab sab sahi parse hota hai."""
+    t = raw.strip().replace(" ", "").replace(".", ":")
+    # 13:40 style
+    m = re.fullmatch(r"(\d{1,2}):(\d{1,2})", t)
+    if m:
+        hh, mm = int(m.group(1)), int(m.group(2))
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return ("clock", hh, mm)
+    # 1340 style (4 digit)
+    m = re.fullmatch(r"(\d{4})", t)
+    if m:
+        hh, mm = int(t[:2]), int(t[2:])
+        if 0 <= hh <= 23 and 0 <= mm <= 59:
+            return ("clock", hh, mm)
+    # pure number = minutes from now
+    if re.fullmatch(r"\d+", t):
+        return ("minutes", 0, int(t))
+    return None
+
 def compute_target(time_str):
-    t = time_str.strip()
-    if ":" in t:
-        hh, mm = t.split(":")
+    """Returns the datetime when the promo should run.
+    Clock time (13:40) → aaj us time pe; agar wo time nikal gaya hai to
+    kal ka wait nahi — turant run hota hai (catch-up).
+    Pure number (5) → 5 minute baad."""
+    parsed = parse_time_input(time_str)
+    if parsed is None:
+        raise ValueError("invalid time format")
+    kind, a, b = parsed
+    if kind == "clock":
         now = datetime.now()
-        target = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        return target
-    return datetime.now() + timedelta(minutes=float(t))
+        target = now.replace(hour=a, minute=b, second=0, microsecond=0)
+        return target   # passed ho to past me hai → run_promo turant chala dega
+    return datetime.now() + timedelta(minutes=b)
 
 def split_text(text, limit=4000):
     return [text[i:i + limit] for i in range(0, len(text), limit)]
@@ -314,6 +356,21 @@ def build_status(d):
     lines.append(f"▶️ Running: {'✅ YES' if d.get('running') else '❌ NO'}")
     return "\n".join(lines)
 
+def promo_missing(d, scope="saved"):
+    """Promo start karne ke liye kya-kya missing hai — list return karta hai."""
+    missing = []
+    if not d["accounts"]: missing.append("accounts")
+    if scope == "saved" and not d["groups"]: missing.append("groups")
+    if not d["message"]: missing.append("message")
+    mode = d.get("mode", "once")
+    if mode == "loop":
+        if not d.get("interval"):
+            missing.append("loop interval (⏰ Set Time → 🔁 Loop Mode)")
+    else:
+        if not d["time"]:
+            missing.append("time (⏰ Set Time → 🕐 One-Time)")
+    return missing
+
 # ===================== GROUP LOGIC =====================
 async def warm_peers(user, limit=1000):
     """⚠️ PEER ID FIX — promo account ka peer cache (access_hash) bhar deta hai.
@@ -339,6 +396,47 @@ async def discover_groups(user, limit=500):
     except Exception:
         pass
     return found
+
+async def discover_dms(user, limit=500):
+    """All PRIVATE chats (users) the account has a dialog with.
+    'Saved Messages' (khud ka chat) skip hota hai."""
+    found = []
+    try:
+        me = (await user.get_me()).id
+        async for dialog in user.get_dialogs(limit=limit):
+            c = dialog.chat
+            if c.type == ChatType.PRIVATE and c.id != me:
+                found.append(c)
+    except Exception:
+        pass
+    return found
+
+async def discover_all(user, limit=500):
+    """Groups + private chats — DM + GC mode ke liye."""
+    found = []
+    try:
+        me = (await user.get_me()).id
+        async for dialog in user.get_dialogs(limit=limit):
+            c = dialog.chat
+            if c.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+                found.append(c)
+            elif c.type == ChatType.PRIVATE and c.id != me:
+                found.append(c)
+    except Exception:
+        pass
+    return found
+
+def scope_entries(scope, chats):
+    """Discovered chats ko entry list me convert karta hai (send ke liye)."""
+    if scope == "all_gc":
+        return [{"type": "dialog", "chat": c,
+                 "raw": f"{c.title or c.id} ({c.id})"} for c in chats]
+    if scope == "dm":
+        return [{"type": "dialog", "chat": c,
+                 "raw": f"{c.first_name or c.id} ({c.id})"} for c in chats]
+    # dm_gc
+    return [{"type": "dialog", "chat": c,
+             "raw": f"{(c.title or c.first_name or c.id)} ({c.id})"} for c in chats]
 
 async def add_group_entry(entry, chat_id):
     d = load_data(chat_id)
@@ -370,7 +468,7 @@ async def add_group_entry(entry, chat_id):
 async def resolve_chat_id(user, entry, acc_name):
     """Resolves the group chat ID (joins via username/invite if needed)."""
     if entry["type"] == "dialog":
-        # from 🌐 Promo My GCs — account is already a member, cache is warm
+        # from 🌐 Promo My GCs / DMs — account is already a member, cache is warm
         return entry["chat"].id, None
     if entry["type"] == "id":
         try:
@@ -492,7 +590,8 @@ async def send_to_group(user, entry, acc_name, d, stop_event):
         return "✅" if res == "✅" else f"❌ {res}"
 
 # ===================== PROMO RUNNER =====================
-async def run_promo(chat_id, progress_msg_id, mode_all=False):
+async def run_promo(chat_id, progress_msg_id, scope="saved"):
+    """scope: 'saved' (📋 saved groups) / 'all_gc' / 'dm' / 'dm_gc'"""
     d = load_data(chat_id)
     accounts, groups = d["accounts"], d["groups"]
     time_str = d["time"]
@@ -501,45 +600,49 @@ async def run_promo(chat_id, progress_msg_id, mode_all=False):
 
     ev = asyncio.Event()
     promo_state[chat_id] = ev
+    promo_scope[chat_id] = scope          # 🔄 Restart wahi scope pe chale
     d["running"] = True
     save_data(d, chat_id)
 
+    scope_name = {"saved": "📋 SAVED GROUPS", "all_gc": "🌐 ALL MY GCS",
+                  "dm": "✉️ MY DMs", "dm_gc": "💬 DMs + GCS"}.get(scope, "📋 SAVED GROUPS")
+
     results = []
     try:
-        group_info = ("🌐 Groups: auto-discovered — all where the account is a member"
-                      if mode_all else f"📋 Groups: {len(groups)}")
         if mode == "loop":
-            wait_until = datetime.now()
-            head = ("🌐 **PROMO (ALL MY GCS) STARTING (LOOP MODE)**" if mode_all
-                    else "🔁 **PROMO STARTING (LOOP MODE)**")
+            wait_until = datetime.now()   # loop = turant start
             await bot.edit_message_text(
                 chat_id, progress_msg_id,
-                f"{head}\n\n"
-                f"📱 Accounts: {len(accounts)}\n{group_info}\n"
+                f"🔁 **PROMO STARTING — {scope_name} (LOOP MODE)**\n\n"
+                f"📱 Accounts: {len(accounts)}\n"
                 f"⏱ Interval: every {interval} min\n"
                 f"▶️ Runs now, then repeats until you stop it.\n\n"
                 f"Tap 🛑 to stop.",
                 reply_markup=stop_kb(),
             )
         else:
-            wait_until = compute_target(time_str)
-            head = ("🌐 **PROMO (ALL MY GCS) SCHEDULED**" if mode_all
-                    else "⏳ **PROMO SCHEDULED**")
-            await bot.edit_message_text(
-                chat_id, progress_msg_id,
-                f"{head}\n\n"
-                f"📱 Accounts: {len(accounts)}\n{group_info}\n"
-                f"⏰ Time: {time_str} ({wait_until.strftime('%H:%M:%S')})\n\n"
-                f"Tap 🛑 to stop.",
-                reply_markup=stop_kb(),
-            )
+            try:
+                wait_until = compute_target(time_str)
+            except Exception:
+                wait_until = datetime.now()   # fallback: turant run
+            delta = (wait_until - datetime.now()).total_seconds()
+            if delta > 0:
+                await bot.edit_message_text(
+                    chat_id, progress_msg_id,
+                    f"⏳ **PROMO SCHEDULED — {scope_name}**\n\n"
+                    f"📱 Accounts: {len(accounts)}\n"
+                    f"⏰ Run at: **{wait_until.strftime('%H:%M:%S')}**\n\n"
+                    f"Tap 🛑 to stop.",
+                    reply_markup=stop_kb(),
+                )
 
         run_number = 0
         while True:
-            # ---- wait until the run time (loop mode waits between runs) ----
-            delta = (wait_until - datetime.now()).total_seconds()
-            if delta > 0:
-                await asyncio.sleep(delta)
+            # ---- wait in small chunks (STOP turant respond kare) ----
+            while datetime.now() < wait_until:
+                if ev.is_set():
+                    break
+                await asyncio.sleep(min(5, (wait_until - datetime.now()).total_seconds()))
             if ev.is_set():
                 break
 
@@ -560,16 +663,19 @@ async def run_promo(chat_id, progress_msg_id, mode_all=False):
                     async with Client(f"pr_{chat_id}_{i}", API_ID, API_HASH,
                                       session_string=acc["session"], in_memory=True) as user:
                         await warm_peers(user)   # ⚠️ PEER ID FIX: cache bharo (bot ko touch nahi karta)
-                        if mode_all:
+                        if scope != "saved":
                             await bot.edit_message_text(
                                 chat_id, progress_msg_id,
-                                f"🌐 **Run #{run_number}** — {acc['name']} → scanning your groups...",
+                                f"🔎 **Run #{run_number}** — {acc['name']} → scanning your chats...",
                                 reply_markup=stop_kb(),
                             )
-                            chats = await discover_groups(user)
-                            entries = [{"type": "dialog", "chat": c,
-                                        "raw": f"{c.title or c.id} ({c.id})"}
-                                       for c in chats]
+                            if scope == "all_gc":
+                                chats = await discover_groups(user)
+                            elif scope == "dm":
+                                chats = await discover_dms(user)
+                            else:
+                                chats = await discover_all(user)
+                            entries = scope_entries(scope, chats)
                         for entry in entries:
                             res = await send_to_group(user, entry, acc["name"], d, ev)
                             if res == "✅":
@@ -582,11 +688,11 @@ async def run_promo(chat_id, progress_msg_id, mode_all=False):
                 except Exception as e:
                     fail += 1
                     results.append(f"❌ {acc['name']}: {e}")
-                extra = f" ({len(entries)} groups)" if mode_all else ""
+                extra = f" ({len(entries)} targets)" if scope != "saved" else ""
                 results.append(f"{'✅' if fail == 0 else '⚠️'} {acc['name']}: {ok} ok / {fail} fail{extra}")
                 await asyncio.sleep(DELAY_BETWEEN_ACCOUNTS)
 
-            # ---- what happens after this run ----
+            # ---- run khatam hone ke baad ----
             if mode == "loop" and not ev.is_set():
                 next_run = datetime.now() + timedelta(minutes=interval)
                 await bot.edit_message_text(
@@ -596,17 +702,13 @@ async def run_promo(chat_id, progress_msg_id, mode_all=False):
                     f"Tap 🛑 to stop the loop.",
                     reply_markup=stop_kb(),
                 )
-                # sleep in small chunks so the STOP button responds fast
-                while datetime.now() < next_run:
-                    if ev.is_set():
-                        break
-                    await asyncio.sleep(5)
+                wait_until = next_run
             else:
                 # one-time mode: finished
                 await bot.edit_message_text(
                     chat_id, progress_msg_id,
-                    f"🏁 **PROMO DONE**\n\n" + "\n".join(results),
-                    reply_markup=main_kb(),
+                    f"🏁 **PROMO DONE — {scope_name}**\n\n" + "\n".join(results),
+                    reply_markup=restart_kb(),
                 )
                 break
 
@@ -615,7 +717,7 @@ async def run_promo(chat_id, progress_msg_id, mode_all=False):
             txt = "🛑 **PROMO STOPPED**"
             if results:
                 txt += "\n\n" + "\n".join(results)
-            await bot.edit_message_text(chat_id, progress_msg_id, txt, reply_markup=main_kb())
+            await bot.edit_message_text(chat_id, progress_msg_id, txt, reply_markup=restart_kb())
     finally:
         d = load_data(chat_id)
         d["running"] = False
@@ -665,17 +767,27 @@ async def help_cmd(client, message: Message):
 
 **5️⃣ SET TIME — choose a mode**
 • Tap ⏰ Set Time → pick one:
-• 🕐 **One-Time** — `5` = 5 minutes from now | `14:30` = today at 14:30 (tomorrow if already passed)
+• 🕐 **One-Time** — `5` = 5 minutes from now | `13:40` = today at 13:40
+   — agar 13:40 nikal gaya hai to START dabate hi turant run hota hai
+   (13:40 / 1340 / 13 40 / 13.40 — sab chalega)
 • 🔁 **Loop Mode** — send interval in minutes (`10`, `30`, `60`...)
    — promo runs NOW, then repeats every X minutes until you tap 🛑
 
 **6️⃣ START**
 • Tap 🚀 START PROMO — sends photo + message to all saved groups from all accounts 🚀
 
-**7️⃣ PROMO MY GCS (NEW)**
+**7️⃣ PROMO MY GCS**
 • Tap 🌐 Promo My GCs — bot scans ALL groups where your accounts are
   already members and sends the promo to every one of them
   (no need to add groups one by one)
+
+**8️⃣ DMS / DM + GC (NEW)**
+• ✉️ Promo My DMs — sends to ALL private chats of your accounts
+• 💬 Promo DM + GC — sends to DMs + groups in one run
+
+**9️⃣ RESTART (NEW)**
+• Promo stop/done hone ke baad 🔄 Restart Promo button — wahi scope
+  (saved / all GCs / DMs / DM+GC) wapas chala deta hai
 
 **🔐 PRIVACY**
 • Every user sees ONLY their own data — accounts, groups, everything is private.
@@ -805,7 +917,11 @@ async def on_cb(client, cb: CallbackQuery):
     if data == "time_once":
         user_state[chat_id] = {"step": "time", "sub": "once"}
         await cb.message.edit_text(
-            "🕐 **ONE-TIME SCHEDULE**\n\n`5` = 5 minutes from now\n`14:30` = today at 14:30\n\nCancel: /cancel",
+            "🕐 **ONE-TIME SCHEDULE**\n\n"
+            "`5` = 5 minutes from now\n"
+            "`13:40` / `1340` / `13 40` = today at 13:40\n"
+            "(agar time nikal gaya to START dabate hi turant run hoga)\n\n"
+            "Cancel: /cancel",
             reply_markup=back_kb(),
         )
         await cb.answer(); return
@@ -824,43 +940,33 @@ async def on_cb(client, cb: CallbackQuery):
         await cb.message.edit_text(build_status(d), reply_markup=main_kb())
         await cb.answer(); return
 
-    if data == "start_promo":
-        missing = []
-        if not d["accounts"]: missing.append("accounts")
-        if not d["groups"]: missing.append("groups")
-        if not d["message"]: missing.append("message")
-        mode = d.get("mode", "once")
-        if mode == "loop":
-            if not d.get("interval"):
-                missing.append("loop interval (⏰ Set Time → 🔁 Loop Mode)")
-        else:
-            if not d["time"]:
-                missing.append("time (⏰ Set Time → 🕐 One-Time)")
+    # ---- START PROMO (4 scope buttons: saved / all_gc / dm / dm_gc) ----
+    if data in ("start_promo", "promo_all", "promo_dm", "promo_dm_gc"):
+        scope = {"start_promo": "saved", "promo_all": "all_gc",
+                 "promo_dm": "dm", "promo_dm_gc": "dm_gc"}[data]
+        missing = promo_missing(d, scope)
         if missing:
             await cb.answer(f"❌ Set these first: {', '.join(missing)}", show_alert=True); return
         if promo_state.get(chat_id):
             await cb.answer("⏳ Promo already running!", show_alert=True); return
-        msg = await cb.message.edit_text("🚀 **PROMO IS STARTING...**")
-        asyncio.create_task(run_promo(chat_id, msg.id))
+        starts = {"saved": "🚀 **PROMO IS STARTING...**",
+                  "all_gc": "🌐 **SCANNING YOUR GROUPS...**",
+                  "dm": "✉️ **SCANNING YOUR DMs...**",
+                  "dm_gc": "💬 **SCANNING DMs + GROUPS...**"}
+        msg = await cb.message.edit_text(starts[scope])
+        asyncio.create_task(run_promo(chat_id, msg.id, scope))
         await cb.answer(); return
 
-    if data == "promo_all":
-        missing = []
-        if not d["accounts"]: missing.append("accounts")
-        if not d["message"]: missing.append("message")
-        mode = d.get("mode", "once")
-        if mode == "loop":
-            if not d.get("interval"):
-                missing.append("loop interval (⏰ Set Time → 🔁 Loop Mode)")
-        else:
-            if not d["time"]:
-                missing.append("time (⏰ Set Time → 🕐 One-Time)")
+    # ---- RESTART (stop ke baad wala button — wahi scope wapas) ----
+    if data == "restart_promo":
+        scope = promo_scope.get(chat_id) or "saved"
+        missing = promo_missing(d, scope)
         if missing:
             await cb.answer(f"❌ Set these first: {', '.join(missing)}", show_alert=True); return
         if promo_state.get(chat_id):
             await cb.answer("⏳ Promo already running!", show_alert=True); return
-        msg = await cb.message.edit_text("🌐 **SCANNING YOUR GROUPS...**")
-        asyncio.create_task(run_promo(chat_id, msg.id, mode_all=True))
+        msg = await cb.message.edit_text("🚀 **RESTARTING PROMO...**")
+        asyncio.create_task(run_promo(chat_id, msg.id, scope))
         await cb.answer(); return
 
     if data == "stop_promo":
@@ -1055,7 +1161,7 @@ async def handle_text(client, message: Message):
         )
 
     elif st["step"] == "time":
-        t = text.replace(" ", "")
+        t = text.replace(" ", "").replace(".", ":")
         sub = st.get("sub", "once")
         if sub == "loop":
             # 🔁 Loop mode: interval in minutes
@@ -1082,14 +1188,19 @@ async def handle_text(client, message: Message):
             try:
                 compute_target(t)
             except Exception:
-                await message.reply_text("❌ Invalid format. Send `5` (minutes) or `14:30` (time).")
+                await message.reply_text(
+                    "❌ Invalid format. Send `5` (minutes) or `13:40` (time).")
                 return
             d = load_data(chat_id)
             d["mode"] = "once"
             d["time"] = t
             save_data(d, chat_id)
             user_state.pop(chat_id, None)
-            await message.reply_text(f"✅ Time set: **{t}** (one-time)", reply_markup=main_kb())
+            await message.reply_text(
+                f"✅ Time set: **{t}** (one-time)\n\n"
+                f"🕐 Agar ye time nikal gaya hai, to START dabate hi turant run hoga.",
+                reply_markup=main_kb()
+            )
 
 # ===================== PHOTO UPLOAD =====================
 @bot.on_message(filters.photo & filters.private)
@@ -1130,5 +1241,5 @@ if __name__ == "__main__":
                         json.dump(dd, f, ensure_ascii=False, indent=2)
             except Exception:
                 pass
-    print("🤖 Promo Bot v2.1 starting...")
+    print("🤖 Promo Bot v2.2 starting...")
     bot.run()
