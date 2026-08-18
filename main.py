@@ -460,6 +460,7 @@ async def handle_inputs(client: Client, message: Message):
 # ------------------------------------------------------------------
 # BROADCAST ENGINE (FIXED FOR TOPICS/FORUMS & CHAT PERMISSIONS)
 # ------------------------------------------------------------------
+
 async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_id: str = None, interval_minutes: int = 0):
     try:
         while True:
@@ -498,27 +499,10 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
 
                         if should_send:
                             try:
-                                # Fetch fresh chat details to detect topics/forums
-                                full_chat = await user_client.get_chat(chat.id)
-                                thread_id = None
-                                
-                                # If the chat is a forum, target the general topic / top thread
-                                if getattr(full_chat, "is_forum", False):
-                                    thread_id = getattr(dialog, "top_message", None) and getattr(dialog.top_message, "message_thread_id", None)
-
                                 if local_photo_path:
-                                    await user_client.send_photo(
-                                        full_chat.id, 
-                                        photo=local_photo_path, 
-                                        caption=text,
-                                        message_thread_id=thread_id
-                                    )
+                                    await user_client.send_photo(chat.id, photo=local_photo_path, caption=text)
                                 else:
-                                    await user_client.send_message(
-                                        full_chat.id, 
-                                        text=text,
-                                        message_thread_id=thread_id
-                                    )
+                                    await user_client.send_message(chat.id, text=text)
                                 
                                 total_sent += 1
                                 await asyncio.sleep(2)  # Delay between chats to prevent flood
@@ -528,9 +512,9 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                                 await asyncio.sleep(e.value)
                                 try:
                                     if local_photo_path:
-                                        await user_client.send_photo(chat.id, photo=local_photo_path, caption=text, message_thread_id=thread_id)
+                                        await user_client.send_photo(chat.id, photo=local_photo_path, caption=text)
                                     else:
-                                        await user_client.send_message(chat.id, text=text, message_thread_id=thread_id)
+                                        await user_client.send_message(chat.id, text=text)
                                     total_sent += 1
                                 except Exception:
                                     total_failed += 1
@@ -540,6 +524,7 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                                 await asyncio.sleep(e.value)
                             
                             except Exception as err:
+                                # Skips chats where posting isn't allowed (e.g. admin-only channels or closed groups)
                                 logger.error(f"Failed to send to {chat.title or chat.id} via {phone}: {err}")
                                 total_failed += 1
 
