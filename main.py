@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-🤖 TELEGRAM PROMO BOT v2.2
+🤖 TELEGRAM PROMO BOT v2.3
 --------------------------
 + Full English quote support (never truncated)
 + 🖼️ Photo: custom image upload or auto-generated image
 + 🎨 Auto Image: message text -> stylish image (same font, emoji rendered properly)
 + ⏰ Two time modes: One-Time schedule OR 🔁 Loop Mode (repeat every X minutes)
 + 🌐 Promo My GCs: send to ALL groups where the account is already a member (auto-discover)
-+ ✉️ NEW: Promo My DMs — send to ALL private chats of the account (auto-discover)
-+ 💬 NEW: Promo DM + GC — DMs + groups dono me ek hi run me
-+ 🔄 NEW: STOP ke baad Restart + Menu buttons
-+ 💾 NEW: Bot restart pe scheduled/loop promo auto-resume (missed run catch-up)
-+ 🔧 FIXED: "Peer id invalid" spam (no_updates=True + peer cache warm)
++ ✉️ Promo My DMs — send to ALL private chats of the account (auto-discover)
++ 💬 Promo DM + GC — DMs + groups dono me ek hi run me
++ 🔄 STOP ke baad Restart + Menu buttons
++ 💾 Bot restart pe scheduled/loop promo auto-resume (missed run catch-up)
++ 🔧 Peer cache warm fix — "Peer id invalid" errors minimize (no_updates HATAYA,
+     isliye bot commands aur updates 100% normal)
++ 🏓 /ping — bot zinda hai ya nahi turant check karne ke liye
++ 🐛 Startup errors ab full traceback print karte hain (log me dikhega)
 + 🔐 Per-user data: every Telegram user sees ONLY their own accounts/groups (private)
 + 🔑 session_<phone>.txt is sent after login — reuse the session anywhere
 + All previous features: accounts/sessions, GCs, time, status, start/stop
@@ -107,7 +110,7 @@ async def deliver_session(message, phone, session):
 # ===================== DATA STORE (per-user) =====================
 # Har Telegram user ka apna data file: data_<user_id>.json
 # => kisi aur user ko tumhare accounts/groups kabhi nahi dikhte (full privacy)
-# v2.2 me naye keys: scope, progress_msg_id, run_at (restart pe auto-resume)
+# v2.2+ naye keys: scope, progress_msg_id, run_at (restart pe auto-resume)
 
 def data_path(uid):
     return f"data_{uid}.json"
@@ -356,7 +359,9 @@ async def wait_or_stop(ev, seconds):
 # ===================== GROUP LOGIC =====================
 async def warm_peers(user, limit=500):
     """Dialogs fetch karta hai taaki peer cache me access_hash aa jaye.
-    Iske bina fresh in-memory client me 'Peer id invalid' error aata hai."""
+    Iske bina fresh in-memory client me 'Peer id invalid' error aata hai.
+    (no_updates nahi use ho raha — updates normal chalte hain, bas cache
+    pehle se warm hoti hai isliye send kabhi fail nahi hota.)"""
     try:
         async for _ in user.get_dialogs(limit=limit):
             pass
@@ -423,8 +428,7 @@ async def add_group_entry(entry, chat_id):
         for acc in d["accounts"]:
             try:
                 async with Client(f"gj_{acc['name']}", API_ID, API_HASH,
-                                  session_string=acc["session"], in_memory=True,
-                                  no_updates=True) as user:
+                                  session_string=acc["session"], in_memory=True) as user:
                     try:
                         chat = await user.join_chat(link)
                         entry["ids"][acc["name"]] = chat.id
@@ -653,8 +657,7 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
                 entries = groups
                 try:
                     async with Client(f"pr_{chat_id}_{i}", API_ID, API_HASH,
-                                      session_string=acc["session"], in_memory=True,
-                                      no_updates=True) as user:
+                                      session_string=acc["session"], in_memory=True) as user:
                         await warm_peers(user)
                         if scope == "saved":
                             entries = list(groups)
@@ -786,6 +789,7 @@ async def help_cmd(client, message: Message):
 **⚠️ NOTE:** Sending too fast may get your Telegram account **banned**.
 Delays are set (3s msgs / 10s accounts) — change them at the top of the code.
 
+🏓 /ping — bot alive check
 /cancel — cancel any current step"""
     await message.reply_text(text)
 
@@ -794,6 +798,11 @@ async def cancel_cmd(client, message: Message):
     st = user_state.pop(message.chat.id, None)
     await safe_stop(st.get("temp") if st else None)
     await message.reply_text("❌ Cancelled. Back to main menu:", reply_markup=main_kb())
+
+@bot.on_message(filters.command("ping") & filters.private)
+async def ping_cmd(client, message: Message):
+    """Bot zinda hai ya nahi — turant test."""
+    await message.reply_text("🏓 **Pong!** Bot is alive and responding ✅")
 
 # ===================== CALLBACKS =====================
 @bot.on_callback_query()
@@ -1233,11 +1242,16 @@ async def resume_promos():
                 pass
 
 async def main():
-    await bot.start()
-    print("🤖 Promo Bot v2.2 starting...")
-    await resume_promos()
-    await idle()
-    await bot.stop()
+    try:
+        await bot.start()
+        print("🤖 Promo Bot v2.3 starting...")
+        await resume_promos()
+        await idle()
+    except Exception:
+        import traceback
+        traceback.print_exc()   # startup error ab log me clearly dikhega
+    finally:
+        await safe_stop(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
