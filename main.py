@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-🤖 TELEGRAM PROMO BOT v2.2 (FIXED EDITION)
-------------------------------------------
+🤖 TELEGRAM PROMO BOT v2.3 (ULTRACLEAN & FIXED EDITION)
+------------------------------------------------------
 + Full English quote support (never truncated)
 + 🖼️ Photo: custom image upload or auto-generated image
 + 🎨 Auto Image: message text -> stylish image (same font, emoji rendered properly)
@@ -11,7 +11,7 @@
 + 💬 Promo DM + GC: DMs + groups dono ek hi run me
 + 🔄 STOP/DONE ke baad Restart + Main Menu buttons
 + ⏰ Smart time parsing (13:40 / 1340 / 13 40 / 13.40)
-+ 🔧 PEER ID FIX & Smooth Discovery (No message spam rate-limits)
++ 🔧 PEER RESOLUTION & DISCOVERY FIX: Auto-cache peers & safe scope entries handling
 """
 
 import asyncio
@@ -337,71 +337,70 @@ def promo_missing(d, scope="saved"):
             missing.append("time (⏰ Set Time → 🕐 One-Time)")
     return missing
 
-# ===================== GROUP LOGIC =====================
-async def warm_peers(user, limit=1000):
+# ===================== GROUP & DM DISCOVERY (FIXED) =====================
+async def warm_peers(user, limit=500):
+    """Warms up local peer cache so get_chat(id) doesn't fail."""
     count = 0
     try:
         async for dialog in user.get_dialogs(limit=limit):
             count += 1
     except Exception as e:
-        print(f"[PEER ERROR] {e}")
+        print(f"[PEER WARMUP ERROR] {e}")
     return count
 
-async def discover_groups(user, limit=1000):
+async def discover_groups(user, limit=500):
     found = []
     try:
         async for dialog in user.get_dialogs(limit=limit):
             try:
-                chat = dialog.chat
-                if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-                    found.append(chat)
+                if dialog.chat and dialog.chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+                    found.append(dialog.chat)
             except Exception:
                 continue
     except Exception as e:
         print(f"[DISCOVERY GC ERROR] {e}")
     return found
 
-async def discover_dms(user, limit=1000):
+async def discover_dms(user, limit=500):
     found = []
     try:
         me = (await user.get_me()).id
         async for dialog in user.get_dialogs(limit=limit):
             try:
-                c = dialog.chat
-                if c.type == ChatType.PRIVATE and c.id != me:
-                    found.append(c)
+                if dialog.chat and dialog.chat.type == ChatType.PRIVATE and dialog.chat.id != me:
+                    found.append(dialog.chat)
             except Exception:
                 continue
     except Exception as e:
         print(f"[DISCOVERY DM ERROR] {e}")
     return found
 
-async def discover_all(user, limit=1000):
+async def discover_all(user, limit=500):
     found = []
     try:
         me = (await user.get_me()).id
         async for dialog in user.get_dialogs(limit=limit):
             try:
-                chat = dialog.chat
-                if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-                    found.append(chat)
-                elif chat.type == ChatType.PRIVATE and chat.id != me:
-                    found.append(chat)
+                c = dialog.chat
+                if c and (c.type in (ChatType.GROUP, ChatType.SUPERGROUP) or (c.type == ChatType.PRIVATE and c.id != me)):
+                    found.append(c)
             except Exception:
                 continue
     except Exception as e:
-        print(f"[DISCOVERY DM+GC ERROR] {e}")
+        print(f"[DISCOVERY ALL ERROR] {e}")
     return found
 
 def scope_entries(scope, chats):
-    if scope == "all_gc":
-        return [{"type": "dialog", "chat": c,
-                 "raw": f"{c.title or c.id} ({c.id})"} for c in chats]
-    if scope == "dm":
-        return [{"type": "dialog", "chat": c,
-                 "raw": f"{getattr(c, 'first_name', '') or c.id} ({c.id})"} for c in chats]
-    return [{"type": "dialog", "chat": c,
-             "raw": f"{(getattr(c, 'title', None) or getattr(c, 'first_name', None) or c.id)} ({c.id})"} for c in chats]
+    entries = []
+    for c in chats:
+        name = getattr(c, "title", None) or getattr(c, "first_name", None) or str(c.id)
+        entries.append({
+            "type": "id",
+            "value": c.id,
+            "raw": f"{name} ({c.id})",
+            "ids": {}
+        })
+    return entries
 
 async def add_group_entry(entry, chat_id):
     d = load_data(chat_id)
@@ -431,19 +430,15 @@ async def add_group_entry(entry, chat_id):
     save_data(d, chat_id)
 
 async def resolve_chat_id(user, entry, acc_name):
-    if entry["type"] == "dialog":
-        return entry["chat"].id, None
     if entry["type"] == "id":
+        cid = entry["value"]
         try:
-            chat = await user.get_chat(entry["value"])
+            chat = await user.get_chat(cid)
             return chat.id, None
         except Exception:
-            await warm_peers(user)
-            try:
-                chat = await user.get_chat(entry["value"])
-                return chat.id, None
-            except Exception:
-                return None, f"account cannot access chat {entry['value']}"
+            # Fallback: send directly using ID if peer exists in user cache
+            return cid, None
+
     if entry["type"] == "username":
         try:
             await user.join_chat(entry["value"])
@@ -471,11 +466,7 @@ async def resolve_chat_id(user, entry, acc_name):
         await warm_peers(user)
         cid = entry["ids"].get(acc_name)
         if cid is not None:
-            try:
-                await user.get_chat(cid)
-                return cid, None
-            except Exception:
-                pass
+            return cid, None
         return None, "Chat ID could not be resolved"
     except Exception as e:
         return None, f"join failed: {e}"
@@ -528,7 +519,7 @@ async def send_to_group(user, entry, acc_name, d, stop_event):
     chat_id, err = await resolve_chat_id(user, entry, acc_name)
     if err:
         return f"❌ {err}"
-    force_text = (entry["type"] == "id")
+    force_text = False
     try:
         res = await send_payload(user, chat_id, d, stop_event, force_text=force_text)
         return "✅" if res == "✅" else f"❌ {res}"
@@ -609,23 +600,23 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
                     async with Client(f"pr_{chat_id}_{i}", API_ID, API_HASH,
                                       session_string=acc["session"], in_memory=True) as user:
                         
-                        # --- CLEANED & RELIABLE DISCOVERY BLOCK ---
+                        # --- CLEAN DISCOVERY & PEER WARMUP BLOCK ---
                         if scope != "saved":
                             await bot.edit_message_text(
                                 chat_id, progress_msg_id,
                                 f"🔎 **DISCOVERING CHATS ({scope_name})**\n\n"
                                 f"👤 Account: `{acc['name']}`\n"
-                                f"📡 Reading Telegram dialogs, please wait...",
+                                f"📡 Fetching targets, please wait...",
                                 reply_markup=stop_kb(),
                             )
                             
                             chats = []
                             if scope == "all_gc":
-                                chats = await discover_groups(user, limit=1000)
+                                chats = await discover_groups(user, limit=500)
                             elif scope == "dm":
-                                chats = await discover_dms(user, limit=1000)
+                                chats = await discover_dms(user, limit=500)
                             elif scope == "dm_gc":
-                                chats = await discover_all(user, limit=1000)
+                                chats = await discover_all(user, limit=500)
                                 
                             entries = scope_entries(scope, chats)
                             
@@ -635,6 +626,8 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
                                 f"👤 Sending messages via `{acc['name']}`...",
                                 reply_markup=stop_kb(),
                             )
+                        else:
+                            await warm_peers(user)
 
                         for entry in entries:
                             res = await send_to_group(user, entry, acc["name"], d, ev)
@@ -1000,5 +993,5 @@ if __name__ == "__main__":
                         json.dump(dd, f, ensure_ascii=False, indent=2)
             except Exception:
                 pass
-    print("🤖 Promo Bot v2.2 starting...")
+    print("🤖 Promo Bot v2.3 starting...")
     bot.run()
