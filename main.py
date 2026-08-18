@@ -386,44 +386,75 @@ async def warm_peers(user, limit=1000):
         pass
 
 async def discover_groups(user, limit=500):
-    """All GROUPS/SUPERGROUPS the account is ALREADY a member of."""
     found = []
+
     try:
         async for dialog in user.get_dialogs(limit=limit):
-            c = dialog.chat
-            if c.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-                found.append(c)
-    except Exception:
-        pass
+            chat = dialog.chat
+
+            if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+                found.append(chat)
+
+        print(f"[DISCOVERY][GC] {user.name}: {len(found)} groups found")
+
+    except Exception as e:
+        print(
+            f"[DISCOVERY][GC][ERROR] {user.name}: "
+            f"{type(e).__name__}: {e}"
+        )
+
     return found
+
 
 async def discover_dms(user, limit=500):
-    """All PRIVATE chats (users) the account has a dialog with.
-    'Saved Messages' (khud ka chat) skip hota hai."""
     found = []
+
     try:
-        me = (await user.get_me()).id
+        me = await user.get_me()
+
         async for dialog in user.get_dialogs(limit=limit):
-            c = dialog.chat
-            if c.type == ChatType.PRIVATE and c.id != me:
-                found.append(c)
-    except Exception:
-        pass
+            chat = dialog.chat
+
+            if chat.type == ChatType.PRIVATE and chat.id != me.id:
+                found.append(chat)
+
+        print(f"[DISCOVERY][DM] {user.name}: {len(found)} private chats found")
+
+    except Exception as e:
+        print(
+            f"[DISCOVERY][DM][ERROR] {user.name}: "
+            f"{type(e).__name__}: {e}"
+        )
+
     return found
 
+
 async def discover_all(user, limit=500):
-    """Groups + private chats — DM + GC mode ke liye."""
     found = []
+
     try:
-        me = (await user.get_me()).id
+        me = await user.get_me()
+
         async for dialog in user.get_dialogs(limit=limit):
-            c = dialog.chat
-            if c.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-                found.append(c)
-            elif c.type == ChatType.PRIVATE and c.id != me:
-                found.append(c)
-    except Exception:
-        pass
+            chat = dialog.chat
+
+            if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+                found.append(chat)
+
+            elif chat.type == ChatType.PRIVATE and chat.id != me.id:
+                found.append(chat)
+
+        print(
+            f"[DISCOVERY][DM+GC] {user.name}: "
+            f"{len(found)} total chats found"
+        )
+
+    except Exception as e:
+        print(
+            f"[DISCOVERY][DM+GC][ERROR] {user.name}: "
+            f"{type(e).__name__}: {e}"
+        )
+
     return found
 
 def scope_entries(scope, chats):
@@ -664,18 +695,35 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
                                       session_string=acc["session"], in_memory=True) as user:
                         await warm_peers(user)   # ⚠️ PEER ID FIX: cache bharo (bot ko touch nahi karta)
                         if scope != "saved":
-                            await bot.edit_message_text(
-                                chat_id, progress_msg_id,
-                                f"🔎 **Run #{run_number}** — {acc['name']} → scanning your chats...",
-                                reply_markup=stop_kb(),
-                            )
-                            if scope == "all_gc":
-                                chats = await discover_groups(user)
-                            elif scope == "dm":
-                                chats = await discover_dms(user)
-                            else:
-                                chats = await discover_all(user)
-                            entries = scope_entries(scope, chats)
+                             await bot.edit_message_text(
+                                 chat_id, progress_msg_id,
+                                 f"🔎 **Run #{run_number}** — {acc['name']} → scanning your chats...",
+                                 reply_markup=stop_kb(),
+                             )
+
+                             if scope == "all_gc":
+                                 chats = await discover_groups(user)
+                                 label = "GCs"
+
+                             elif scope == "dm":
+                                 chats = await discover_dms(user)
+                                 label = "DMs"
+
+                             else:
+                                 chats = await discover_all(user)
+                                 label = "DMs + GCs"
+
+                             entries = scope_entries(scope, chats)
+
+                             await bot.edit_message_text(
+                                 chat_id,
+                                 progress_msg_id,
+                                 f"🔎 **Chat Discovery Complete**\n\n"
+                                 f"👤 **Account:** `{acc['name']}`\n"
+                                 f"📊 **{label} found:** `{len(chats)}`\n\n"
+                                 f"⚙️ Processing will continue...",
+                                 reply_markup=stop_kb(),
+                             )
                         for entry in entries:
                             res = await send_to_group(user, entry, acc["name"], d, ev)
                             if res == "✅":
