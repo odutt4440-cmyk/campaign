@@ -373,59 +373,131 @@ def promo_missing(d, scope="saved"):
 
 # ===================== GROUP LOGIC =====================
 async def warm_peers(user, limit=1000):
-    """⚠️ PEER ID FIX — promo account ka peer cache (access_hash) bhar deta hai.
-    in_memory=True client ka cache khali hota hai, isliye numeric chat ID se
-    send karne pe 'Peer id invalid' aata hai. Ye SIRF promo client use karta hai
-    — bot client / commands ko koi farak nahi padta. no_updates ki zaroorat nahi."""
-    try:
-        async for _ in user.get_dialogs(limit=limit):
-            pass
-    except FloodWait as e:
-        await asyncio.sleep(min(e.x, 300))
-    except Exception:
-        pass
+    """
+    Load Telegram dialogs into the current user client.
 
-async def discover_groups(user, limit=500):
-    found = []
+    This is read-only.
+    It is used to verify that the logged-in account can actually
+    retrieve its Telegram dialogs and their peer information.
+    """
+
+    count = 0
+
+    print("\n" + "=" * 60)
+    print(f"[PEER] Warming peers for: {user.name}")
+    print("=" * 60)
 
     try:
         async for dialog in user.get_dialogs(limit=limit):
+
+            count += 1
             chat = dialog.chat
 
-            if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
-                found.append(chat)
+            chat_type = str(chat.type)
+            chat_id = getattr(chat, "id", None)
+            title = getattr(chat, "title", None)
+            username = getattr(chat, "username", None)
 
-        print(f"[DISCOVERY][GC] {user.name}: {len(found)} groups found")
+            print(
+                f"[PEER] #{count} | "
+                f"type={chat_type} | "
+                f"id={chat_id} | "
+                f"title={title!r} | "
+                f"username={username!r}"
+            )
+
+        print("=" * 60)
+        print(
+            f"[PEER] DONE | "
+            f"account={user.name} | "
+            f"dialogs={count}"
+        )
+        print("=" * 60)
+
+        return count
 
     except Exception as e:
+
+        print("=" * 60)
         print(
-            f"[DISCOVERY][GC][ERROR] {user.name}: "
+            f"[PEER][ERROR] "
             f"{type(e).__name__}: {e}"
         )
+        print("=" * 60)
+
+        return 0
+
+
+async def discover_groups(user, limit=1000):
+    """
+    Read-only discovery of groups/supergroups
+    from the logged-in account's dialogs.
+    """
+
+    found = []
+
+    print("\n" + "=" * 60)
+    print(f"[DISCOVERY][GC] START | {user.name}")
+    print("=" * 60)
+
+    try:
+
+        async for dialog in user.get_dialogs(limit=limit):
+
+            chat = dialog.chat
+
+            print(
+                f"[DISCOVERY][GC] CHECK | "
+                f"type={chat.type} | "
+                f"id={chat.id} | "
+                f"title={getattr(chat, 'title', None)!r}"
+            )
+
+            if chat.type in (
+                ChatType.GROUP,
+                ChatType.SUPERGROUP
+            ):
+                found.append(chat)
+
+        print("=" * 60)
+        print(
+            f"[DISCOVERY][GC] COMPLETE | "
+            f"account={user.name} | "
+            f"groups={len(found)}"
+        )
+
+        for index, chat in enumerate(found, 1):
+            print(
+                f"[DISCOVERY][GC] "
+                f"{index}. "
+                f"{getattr(chat, 'title', None)!r} "
+                f"| id={chat.id}"
+            )
+
+        print("=" * 60)
+
+    except Exception as e:
+
+        print("=" * 60)
+        print(
+            f"[DISCOVERY][GC][ERROR] "
+            f"{type(e).__name__}: {e}"
+        )
+        print("=" * 60)
 
     return found
 
-
 async def discover_dms(user, limit=500):
+    """All PRIVATE chats (users) the account has a dialog with."""
     found = []
-
     try:
-        me = await user.get_me()
-
+        me = (await user.get_me()).id
         async for dialog in user.get_dialogs(limit=limit):
-            chat = dialog.chat
-
-            if chat.type == ChatType.PRIVATE and chat.id != me.id:
-                found.append(chat)
-
-        print(f"[DISCOVERY][DM] {user.name}: {len(found)} private chats found")
-
-    except Exception as e:
-        print(
-            f"[DISCOVERY][DM][ERROR] {user.name}: "
-            f"{type(e).__name__}: {e}"
-        )
-
+            c = dialog.chat
+            if c.type == ChatType.PRIVATE and c.id != me:
+                found.append(c)
+    except Exception:
+        pass
     return found
 
 
@@ -695,33 +767,161 @@ async def run_promo(chat_id, progress_msg_id, scope="saved"):
                                       session_string=acc["session"], in_memory=True) as user:
                         await warm_peers(user)   # ⚠️ PEER ID FIX: cache bharo (bot ko touch nahi karta)
                         if scope != "saved":
-                             await bot.edit_message_text(
-                                 chat_id, progress_msg_id,
-                                 f"🔎 **Run #{run_number}** — {acc['name']} → scanning your chats...",
-                                 reply_markup=stop_kb(),
-                             )
 
-                             if scope == "all_gc":
-                                 chats = await discover_groups(user)
-                                 label = "GCs"
-
-                             elif scope == "dm":
-                                 chats = await discover_dms(user)
-                                 label = "DMs"
-
-                             else:
-                                 chats = await discover_all(user)
-                                 label = "DMs + GCs"
-
-                             entries = scope_entries(scope, chats)
+                             # ---------------------------------------------------------
+                             # DISCOVERY START
+                             # ---------------------------------------------------------
 
                              await bot.edit_message_text(
                                  chat_id,
                                  progress_msg_id,
-                                 f"🔎 **Chat Discovery Complete**\n\n"
-                                 f"👤 **Account:** `{acc['name']}`\n"
-                                 f"📊 **{label} found:** `{len(chats)}`\n\n"
-                                 f"⚙️ Processing will continue...",
+                                 f"🔎 **DISCOVERY STARTED**\n\n"
+                                 f"👤 Account: `{acc['name']}`\n"
+                                 f"📡 Reading Telegram dialogs...\n\n"
+                                 f"Please wait...",
+                                 reply_markup=stop_kb(),
+                             )
+
+                             print("\n" + "#" * 70)
+                             print(f"# DISCOVERY START")
+                             print(f"# ACCOUNT: {acc['name']}")
+                             print("#" * 70)
+
+                             # First load the account's dialogs.
+                             dialog_count = await warm_peers(
+                                 user,
+                                 limit=1000
+                             )
+
+                             print(
+                                 f"[DISCOVERY] Dialogs loaded: {dialog_count}"
+                             )
+
+                             # ---------------------------------------------------------
+                             # GROUP DISCOVERY
+                             # ---------------------------------------------------------
+
+                             if scope == "all_gc":
+
+                                 await bot.edit_message_text(
+                                     chat_id,
+                                     progress_msg_id,
+                                     f"🔎 **SCANNING GROUPS**\n\n"
+                                     f"👤 Account: `{acc['name']}`\n"
+                                     f"📂 Dialogs loaded: `{dialog_count}`\n\n"
+                                     f"Finding groups...",
+                                     reply_markup=stop_kb(),
+                                 )
+
+                                 chats = await discover_groups(
+                                     user,
+                                     limit=1000
+                                 )
+
+                                 label = "GCs"
+
+                             # ---------------------------------------------------------
+                             # DM DISCOVERY
+                             # ---------------------------------------------------------
+
+                             elif scope == "dm":
+
+                                 await bot.edit_message_text(
+                                     chat_id,
+                                     progress_msg_id,
+                                     f"🔎 **SCANNING PRIVATE CHATS**\n\n"
+                                     f"👤 Account: `{acc['name']}`\n"
+                                     f"📂 Dialogs loaded: `{dialog_count}`\n\n"
+                                     f"Reading private dialogs...",
+                                     reply_markup=stop_kb(),
+                                 )
+
+                                 chats = await discover_dms(
+                                     user,
+                                     limit=1000
+                                 )
+
+                                 label = "DMs"
+
+                             # ---------------------------------------------------------
+                             # DM + GC
+                             # ---------------------------------------------------------
+
+                             else:
+
+                                 await bot.edit_message_text(
+                                     chat_id,
+                                     progress_msg_id,
+                                     f"🔎 **SCANNING CHATS**\n\n"
+                                     f"👤 Account: `{acc['name']}`\n"
+                                     f"📂 Dialogs loaded: `{dialog_count}`\n\n"
+                                     f"Reading Telegram dialogs...",
+                                     reply_markup=stop_kb(),
+                                 )
+
+                                 chats = await discover_all(
+                                     user,
+                                     limit=1000
+                                 )
+
+                                 label = "DMs + GCs"
+
+                             # ---------------------------------------------------------
+                             # DISCOVERY RESULT
+                             # ---------------------------------------------------------
+
+                             entries = scope_entries(
+                                 scope,
+                                 chats
+                             )
+
+                             print("\n" + "#" * 70)
+                             print("# DISCOVERY RESULT")
+                             print(f"# ACCOUNT : {acc['name']}")
+                             print(f"# DIALOGS : {dialog_count}")
+                             print(f"# TARGETS : {len(chats)}")
+                             print("#" * 70)
+
+                             for index, chat in enumerate(chats, 1):
+
+                                 print(
+                                     f"[DISCOVERY RESULT] "
+                                     f"{index}. "
+                                     f"type={chat.type} | "
+                                     f"id={chat.id} | "
+                                     f"name={getattr(chat, 'title', None) or getattr(chat, 'first_name', None)!r}"
+                                 )
+
+                             print("#" * 70)
+
+                             # ---------------------------------------------------------
+                             # SHOW RESULT IN TELEGRAM BOT
+                             # ---------------------------------------------------------
+
+                             if len(chats) == 0:
+
+                                 result_text = (
+                                     f"⚠️ **DISCOVERY COMPLETE**\n\n"
+                                     f"👤 Account: `{acc['name']}`\n"
+                                     f"📂 Dialogs loaded: `{dialog_count}`\n"
+                                     f"📊 {label} found: `0`\n\n"
+                                     f"❗ Telegram returned no matching chats."
+                                 )
+
+                             else:
+
+                                 result_text = (
+                                     f"✅ **DISCOVERY COMPLETE**\n\n"
+                                     f"👤 Account: `{acc['name']}`\n"
+                                     f"📂 Dialogs loaded: `{dialog_count}`\n"
+                                     f"📊 {label} found: `{len(chats)}`\n\n"
+                                     f"⚙️ Discovery is working."
+                                      )
+
+                             await bot.edit_message_text(
+                                 chat_id,
+                                 progress_msg_id,
+                                 result_text,
                                  reply_markup=stop_kb(),
                              )
                         for entry in entries:
