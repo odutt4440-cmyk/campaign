@@ -14,7 +14,8 @@ from pyrogram.errors import (
     PhoneCodeInvalid,
     PasswordHashInvalid,
     FloodWait,
-    SlowmodeWait
+    SlowmodeWait,
+    MessageNotModified
 )
 
 # ------------------------------------------------------------------
@@ -110,175 +111,199 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
     data = callback.data
     user_id = callback.from_user.id
 
-    if data == "main_menu":
-        user_states.pop(user_id, None)
-        await callback.message.edit_text(
-            "📍 **Main Menu:** Select an option below.",
-            reply_markup=main_menu_keyboard()
-        )
-
-    elif data == "cancel_action":
-        user_states.pop(user_id, None)
-        await callback.message.edit_text(
-            "❌ Action cancelled.",
-            reply_markup=main_menu_keyboard()
-        )
-
-    elif data == "stop_loop_broadcast":
-        if user_id in active_loops:
-            active_loops[user_id].cancel()
-            del active_loops[user_id]
-            await callback.answer("🛑 Loop Broadcast Stopped successfully!", show_alert=True)
-            await callback.message.edit_text("🛑 **Loop broadcast cancelled.**", reply_markup=main_menu_keyboard())
-        else:
-            await callback.answer("ℹ️ No active loop broadcast found.", show_alert=True)
-
-    # --------------------------------------------------------------
-    # MY ACCOUNTS (USER SPECIFIC ONLY)
-    # --------------------------------------------------------------
-    elif data == "add_account":
-        user_states[user_id] = {"step": "AWAITING_PHONE"}
-        await callback.message.edit_text(
-            "📱 **Add Telegram Account**\n\n"
-            "Please send the phone number in international format (e.g., `+1234567890`)."
-        )
-
-    elif data == "my_accounts":
-        my_accs = user_sessions.get(user_id, {})
-        if not my_accs:
+    try:
+        if data == "main_menu":
+            user_states.pop(user_id, None)
             await callback.message.edit_text(
-                "ℹ️ **You have no active accounts added.**",
+                "📍 **Main Menu:** Select an option below.",
                 reply_markup=main_menu_keyboard()
             )
-            return
 
-        buttons = []
-        for phone in list(my_accs.keys()):
-            buttons.append([
-                InlineKeyboardButton(f"👤 {phone}", callback_data=f"acc_info_{phone}"),
-                InlineKeyboardButton("❌ Remove", callback_data=f"remove_acc_{phone}")
-            ])
-        buttons.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")])
+        elif data == "cancel_action":
+            user_states.pop(user_id, None)
+            await callback.message.edit_text(
+                "❌ Action cancelled.",
+                reply_markup=main_menu_keyboard()
+            )
 
-        await callback.message.edit_text(
-            f"📋 **Your Connected Accounts ({len(my_accs)}):**\n"
-            "Click 'Remove' to delete your session.",
-            reply_markup=InlineKeyboardMarkup(buttons)
-        )
+        elif data == "stop_loop_broadcast":
+            if user_id in active_loops:
+                active_loops[user_id].cancel()
+                del active_loops[user_id]
+                await callback.answer("🛑 Loop Broadcast Stopped successfully!", show_alert=True)
+                await callback.message.edit_text("🛑 **Loop broadcast cancelled.**", reply_markup=main_menu_keyboard())
+            else:
+                await callback.answer("ℹ️ No active loop broadcast found.", show_alert=True)
 
-    elif data.startswith("remove_acc_"):
-        phone = data.replace("remove_acc_", "")
-        if user_id in user_sessions and phone in user_sessions[user_id]:
-            del user_sessions[user_id][phone]
-            await callback.answer(f"Account {phone} removed successfully!", show_alert=True)
-        else:
-            await callback.answer("Account not found.", show_alert=True)
-        
-        await handle_callbacks(client, callback)
+        # --------------------------------------------------------------
+        # MY ACCOUNTS (USER SPECIFIC ONLY)
+        # --------------------------------------------------------------
+        elif data == "add_account":
+            user_states[user_id] = {"step": "AWAITING_PHONE"}
+            await callback.message.edit_text(
+                "📱 **Add Telegram Account**\n\n"
+                "Please send the phone number in international format (e.g., `+1234567890`)."
+            )
 
-    # --------------------------------------------------------------
-    # BROADCAST WORKFLOW (USER SPECIFIC ONLY)
-    # --------------------------------------------------------------
-    elif data == "broadcast_menu":
-        my_accs = user_sessions.get(user_id, {})
-        if not my_accs:
-            await callback.answer("⚠️ Please add at least one account first!", show_alert=True)
-            return
-        
-        await callback.message.edit_text(
-            "📢 **Select Broadcast Destination:**",
-            reply_markup=broadcast_type_keyboard()
-        )
+        elif data == "my_accounts":
+            my_accs = user_sessions.get(user_id, {})
+            if not my_accs:
+                await callback.message.edit_text(
+                    "ℹ️ **You have no active accounts added.**",
+                    reply_markup=main_menu_keyboard()
+                )
+                return
 
-    elif data in ["promo_gc", "promo_dm", "promo_both"]:
-        target_map = {
-            "promo_gc": "Groups & Channels",
-            "promo_dm": "Direct Messages (DMs)",
-            "promo_both": "Groups, Channels & DMs"
-        }
-        user_states[user_id] = {
-            "step": "AWAITING_MEDIA_CHOICE",
-            "target": data
-        }
-        await callback.message.edit_text(
-            f"🎯 **Target:** {target_map[data]}\n\n"
-            "❓ **Do you want to add a photo with your message?**",
-            reply_markup=media_choice_keyboard()
-        )
+            buttons = []
+            for phone in list(my_accs.keys()):
+                buttons.append([
+                    InlineKeyboardButton(f"👤 {phone}", callback_data=f"acc_info_{phone}"),
+                    InlineKeyboardButton("❌ Remove", callback_data=f"remove_acc_{phone}")
+                ])
+            buttons.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")])
 
-    elif data == "media_yes":
-        if user_id in user_states:
-            user_states[user_id]["has_photo"] = True
-            user_states[user_id]["step"] = "AWAITING_PHOTO"
-            await callback.message.edit_text("📸 Send the **Photo** you want to attach.")
+            await callback.message.edit_text(
+                f"📋 **Your Connected Accounts ({len(my_accs)}):**\n"
+                "Click 'Remove' to delete your session.",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
 
-    elif data == "media_no":
-        if user_id in user_states:
-            user_states[user_id]["has_photo"] = False
-            user_states[user_id]["step"] = "AWAITING_TEXT"
-            await callback.message.edit_text("📝 Send your **Promo Text Message** (Emojis & formatting supported).")
-
-    # --------------------------------------------------------------
-    # LOOP & TIME INTERVAL SELECTION
-    # --------------------------------------------------------------
-    elif data == "loop_no":
-        if user_id in user_states:
-            state = user_states[user_id]
-            target = state.get("target")
-            promo_text = state.get("promo_text")
-            photo_file_id = state.get("photo_file_id")
-
-            await callback.message.edit_text("⏳ **Starting One-Time Broadcast...**")
+        elif data.startswith("remove_acc_"):
+            phone = data.replace("remove_acc_", "")
+            if user_id in user_sessions and phone in user_sessions[user_id]:
+                del user_sessions[user_id][phone]
+                await callback.answer(f"Account {phone} removed successfully!", show_alert=True)
+            else:
+                await callback.answer("Account not found.", show_alert=True)
             
-            task = asyncio.create_task(run_user_broadcast(
-                owner_id=user_id,
-                target=target,
-                text=promo_text,
-                photo_file_id=photo_file_id,
-                interval_minutes=0
-            ))
-            active_loops[user_id] = task
-            user_states.pop(user_id, None)
+            # Refresh My Accounts view directly without recursive callback calling
+            my_accs = user_sessions.get(user_id, {})
+            if not my_accs:
+                await callback.message.edit_text(
+                    "ℹ️ **You have no active accounts added.**",
+                    reply_markup=main_menu_keyboard()
+                )
+            else:
+                buttons = []
+                for p in list(my_accs.keys()):
+                    buttons.append([
+                        InlineKeyboardButton(f"👤 {p}", callback_data=f"acc_info_{p}"),
+                        InlineKeyboardButton("❌ Remove", callback_data=f"remove_acc_{p}")
+                    ])
+                buttons.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")])
+                await callback.message.edit_text(
+                    f"📋 **Your Connected Accounts ({len(my_accs)}):**\n"
+                    "Click 'Remove' to delete your session.",
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
 
-    elif data == "loop_yes":
-        if user_id in user_states:
+        # --------------------------------------------------------------
+        # BROADCAST WORKFLOW (USER SPECIFIC ONLY)
+        # --------------------------------------------------------------
+        elif data == "broadcast_menu":
+            my_accs = user_sessions.get(user_id, {})
+            if not my_accs:
+                await callback.answer("⚠️ Please add at least one account first!", show_alert=True)
+                return
+            
             await callback.message.edit_text(
-                "⏱️ **Select Delay Interval for Continuous Loop Broadcast:**\n\n"
-                "• **10 Minutes:** Ideal interval to bypass Standard Slow Mode.\n"
-                "• **15 Minutes:** Safer spacing between consecutive posts.\n"
-                "• **30 Minutes:** Extended gap to prevent flood restrictions.\n"
-                "• **Custom Time:** Enter delay manually in minutes.",
-                reply_markup=loop_delay_keyboard()
+                "📢 **Select Broadcast Destination:**",
+                reply_markup=broadcast_type_keyboard()
             )
 
-    elif data.startswith("delay_"):
-        delay_type = data.replace("delay_", "")
-        if delay_type == "custom":
-            user_states[user_id]["step"] = "AWAITING_CUSTOM_DELAY"
-            await callback.message.edit_text("✏️ Please type the delay time in minutes (e.g. `10`, `20`, `60`):")
-        else:
-            interval_min = int(delay_type)
-            state = user_states[user_id]
-            target = state.get("target")
-            promo_text = state.get("promo_text")
-            photo_file_id = state.get("photo_file_id")
-
+        elif data in ["promo_gc", "promo_dm", "promo_both"]:
+            target_map = {
+                "promo_gc": "Groups & Channels",
+                "promo_dm": "Direct Messages (DMs)",
+                "promo_both": "Groups, Channels & DMs"
+            }
+            user_states[user_id] = {
+                "step": "AWAITING_MEDIA_CHOICE",
+                "target": data
+            }
             await callback.message.edit_text(
-                f"🚀 **Loop Broadcast Initiated!**\n"
-                f"⏱️ **Interval:** Every `{interval_min}` minutes.\n"
-                f"You can stop it anytime from the Main Menu.",
-                reply_markup=main_menu_keyboard()
+                f"🎯 **Target:** {target_map[data]}\n\n"
+                "❓ **Do you want to add a photo with your message?**",
+                reply_markup=media_choice_keyboard()
             )
 
-            task = asyncio.create_task(run_user_broadcast(
-                owner_id=user_id,
-                target=target,
-                text=promo_text,
-                photo_file_id=photo_file_id,
-                interval_minutes=interval_min
-            ))
-            active_loops[user_id] = task
-            user_states.pop(user_id, None)
+        elif data == "media_yes":
+            if user_id in user_states:
+                user_states[user_id]["has_photo"] = True
+                user_states[user_id]["step"] = "AWAITING_PHOTO"
+                await callback.message.edit_text("📸 Send the **Photo** you want to attach.")
+
+        elif data == "media_no":
+            if user_id in user_states:
+                user_states[user_id]["has_photo"] = False
+                user_states[user_id]["step"] = "AWAITING_TEXT"
+                await callback.message.edit_text("📝 Send your **Promo Text Message** (Emojis & formatting supported).")
+
+        # --------------------------------------------------------------
+        # LOOP & TIME INTERVAL SELECTION
+        # --------------------------------------------------------------
+        elif data == "loop_no":
+            if user_id in user_states:
+                state = user_states[user_id]
+                target = state.get("target")
+                promo_text = state.get("promo_text")
+                photo_file_id = state.get("photo_file_id")
+
+                await callback.message.edit_text("⏳ **Starting One-Time Broadcast...**")
+                
+                task = asyncio.create_task(run_user_broadcast(
+                    owner_id=user_id,
+                    target=target,
+                    text=promo_text,
+                    photo_file_id=photo_file_id,
+                    interval_minutes=0
+                ))
+                active_loops[user_id] = task
+                user_states.pop(user_id, None)
+
+        elif data == "loop_yes":
+            if user_id in user_states:
+                await callback.message.edit_text(
+                    "⏱️ **Select Delay Interval for Continuous Loop Broadcast:**\n\n"
+                    "• **10 Minutes:** Ideal interval to bypass Standard Slow Mode.\n"
+                    "• **15 Minutes:** Safer spacing between consecutive posts.\n"
+                    "• **30 Minutes:** Extended gap to prevent flood restrictions.\n"
+                    "• **Custom Time:** Enter delay manually in minutes.",
+                    reply_markup=loop_delay_keyboard()
+                )
+
+        elif data.startswith("delay_"):
+            delay_type = data.replace("delay_", "")
+            if delay_type == "custom":
+                user_states[user_id]["step"] = "AWAITING_CUSTOM_DELAY"
+                await callback.message.edit_text("✏️ Please type the delay time in minutes (e.g. `10`, `20`, `60`):")
+            else:
+                interval_min = int(delay_type)
+                state = user_states[user_id]
+                target = state.get("target")
+                promo_text = state.get("promo_text")
+                photo_file_id = state.get("photo_file_id")
+
+                await callback.message.edit_text(
+                    f"🚀 **Loop Broadcast Initiated!**\n"
+                    f"⏱️ **Interval:** Every `{interval_min}` minutes.\n"
+                    f"You can stop it anytime from the Main Menu.",
+                    reply_markup=main_menu_keyboard()
+                )
+
+                task = asyncio.create_task(run_user_broadcast(
+                    owner_id=user_id,
+                    target=target,
+                    text=promo_text,
+                    photo_file_id=photo_file_id,
+                    interval_minutes=interval_min
+                ))
+                active_loops[user_id] = task
+                user_states.pop(user_id, None)
+
+    except MessageNotModified:
+        # Ignore error if message content is identical
+        pass
 
 # ------------------------------------------------------------------
 # INPUT CAPTURE HANDLER
@@ -484,7 +509,6 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                             except SlowmodeWait as e:
                                 logger.info(f"Slow Mode active in {chat.id}. Waiting for {e.value}s")
                                 await asyncio.sleep(e.value)
-                                # Retry once after waiting
                                 try:
                                     if local_photo_path:
                                         await user_client.send_photo(chat.id, photo=local_photo_path, caption=text)
