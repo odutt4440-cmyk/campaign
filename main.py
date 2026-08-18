@@ -13,7 +13,8 @@ from pyrogram.errors import (
     SessionPasswordNeeded,
     PhoneCodeInvalid,
     PasswordHashInvalid,
-    FloodWait
+    FloodWait,
+    SlowmodeWait
 )
 
 # ------------------------------------------------------------------
@@ -28,11 +29,13 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Multi-Tenant In-Memory Storage
-# Structure: { user_id: { "phone_number": "session_string" } }
 user_sessions = {}
 
 # Workflow state tracker per user
 user_states = {}
+
+# Active loops tracker: { owner_id: asyncio.Task }
+active_loops = {}
 
 # Initialize Main Bot Client
 bot = Client("public_promo_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
@@ -45,6 +48,7 @@ def main_menu_keyboard():
         [InlineKeyboardButton("➕ Add Account", callback_data="add_account"),
          InlineKeyboardButton("👤 My Accounts", callback_data="my_accounts")],
         [InlineKeyboardButton("📢 Broadcast Promo", callback_data="broadcast_menu")],
+        [InlineKeyboardButton("🛑 Stop Loop Broadcast", callback_data="stop_loop_broadcast")],
         [InlineKeyboardButton("❌ Cancel / Reset", callback_data="cancel_action")]
     ])
 
@@ -60,6 +64,22 @@ def media_choice_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🖼️ Yes, Add Photo", callback_data="media_yes"),
          InlineKeyboardButton("📝 Text Only", callback_data="media_no")],
+        [InlineKeyboardButton("⬅️ Cancel", callback_data="cancel_action")]
+    ])
+
+def loop_ask_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 Yes, Enable Loop", callback_data="loop_yes"),
+         InlineKeyboardButton("⚡ No, Send One Time", callback_data="loop_no")],
+        [InlineKeyboardButton("⬅️ Cancel", callback_data="cancel_action")]
+    ])
+
+def loop_delay_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏱️ 10 Minutes (Standard GC Slow Mode)", callback_data="delay_10")],
+        [InlineKeyboardButton("⏱️ 15 Minutes (Safe Interval)", callback_data="delay_15")],
+        [InlineKeyboardButton("⏱️ 30 Minutes (Extended Gap)", callback_data="delay_30")],
+        [InlineKeyboardButton("✏️ Custom Time (Enter Manually)", callback_data="delay_custom")],
         [InlineKeyboardButton("⬅️ Cancel", callback_data="cancel_action")]
     ])
 
@@ -103,6 +123,15 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
             "❌ Action cancelled.",
             reply_markup=main_menu_keyboard()
         )
+
+    elif data == "stop_loop_broadcast":
+        if user_id in active_loops:
+            active_loops[user_id].cancel()
+            del active_loops[user_id]
+            await callback.answer("🛑 Loop Broadcast Stopped successfully!", show_alert=True)
+            await callback.message.edit_text("🛑 **Loop broadcast cancelled.**", reply_markup=main_menu_keyboard())
+        else:
+            await callback.answer("ℹ️ No active loop broadcast found.", show_alert=True)
 
     # --------------------------------------------------------------
     # MY ACCOUNTS (USER SPECIFIC ONLY)
@@ -188,6 +217,68 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
             user_states[user_id]["has_photo"] = False
             user_states[user_id]["step"] = "AWAITING_TEXT"
             await callback.message.edit_text("📝 Send your **Promo Text Message** (Emojis & formatting supported).")
+
+    # --------------------------------------------------------------
+    # LOOP & TIME INTERVAL SELECTION
+    # --------------------------------------------------------------
+    elif data == "loop_no":
+        if user_id in user_states:
+            state = user_states[user_id]
+            target = state.get("target")
+            promo_text = state.get("promo_text")
+            photo_file_id = state.get("photo_file_id")
+
+            await callback.message.edit_text("⏳ **Starting One-Time Broadcast...**")
+            
+            task = asyncio.create_task(run_user_broadcast(
+                owner_id=user_id,
+                target=target,
+                text=promo_text,
+                photo_file_id=photo_file_id,
+                interval_minutes=0
+            ))
+            active_loops[user_id] = task
+            user_states.pop(user_id, None)
+
+    elif data == "loop_yes":
+        if user_id in user_states:
+            await callback.message.edit_text(
+                "⏱️ **Select Delay Interval for Continuous Loop Broadcast:**\n\n"
+                "• **10 Minutes:** Ideal interval to bypass Standard Slow Mode.\n"
+                "• **15 Minutes:** Safer spacing between consecutive posts.\n"
+                "• **30 Minutes:** Extended gap to prevent flood restrictions.\n"
+                "• **Custom Time:** Enter delay manually in minutes.",
+                reply_markup=loop_delay_keyboard()
+            )
+
+    elif data.startswith("delay_"):
+        delay_type = data.replace("delay_", "")
+        if delay_type == "custom":
+            user_states[user_id]["step"] = "AWAITING_CUSTOM_DELAY"
+            await callback.message.edit_text("✏️ Please type the delay time in minutes (e.g. `10`, `20`, `60`):")
+        else:
+            interval_min = int(delay_type)
+            state = user_states[user_id]
+            target = state.get("target")
+            promo_text = state.get("promo_text")
+            photo_file_id = state.get("photo_file_id")
+
+            await callback.message.edit_text(
+                f"🚀 **Loop Broadcast Initiated!**\n"
+                f"⏱️ **Interval:** Every `{interval_min}` minutes.\n"
+                f"You can stop it anytime from the Main Menu.",
+                reply_markup=main_menu_keyboard()
+            )
+
+            task = asyncio.create_task(run_user_broadcast(
+                owner_id=user_id,
+                target=target,
+                text=promo_text,
+                photo_file_id=photo_file_id,
+                interval_minutes=interval_min
+            ))
+            active_loops[user_id] = task
+            user_states.pop(user_id, None)
 
 # ------------------------------------------------------------------
 # INPUT CAPTURE HANDLER
@@ -301,83 +392,141 @@ async def handle_inputs(client: Client, message: Message):
         user_states[user_id]["step"] = "AWAITING_TEXT"
         await message.reply_text("📝 Photo saved! Now send your **Promo Text Message / Caption**.")
 
-    # 5. Capture Text & Execute Broadcast
+    # 5. Capture Text & Ask Loop Preference
     elif step == "AWAITING_TEXT":
         promo_text = message.text or message.caption or ""
+        user_states[user_id]["promo_text"] = promo_text
+        user_states[user_id]["step"] = "AWAITING_LOOP_CHOICE"
+
+        await message.reply_text(
+            "🔁 **Loop Settings:**\n\n"
+            "Do you want to send this broadcast on a **continuous loop / scheduled delay**, or send it **one-time only**?",
+            reply_markup=loop_ask_keyboard()
+        )
+
+    # 6. Custom Delay Input
+    elif step == "AWAITING_CUSTOM_DELAY":
+        if not message.text.isdigit() or int(message.text) <= 0:
+            await message.reply_text("❌ Invalid duration! Please enter a positive number in minutes (e.g., `12`).")
+            return
+
+        interval_min = int(message.text)
         target = state.get("target")
+        promo_text = state.get("promo_text")
         photo_file_id = state.get("photo_file_id")
 
-        await message.reply_text("⏳ **Starting Broadcast using YOUR connected accounts...**")
+        await message.reply_text(
+            f"🚀 **Loop Broadcast Initiated!**\n"
+            f"⏱️ **Interval:** Every `{interval_min}` minutes.\n"
+            f"You can stop it anytime from the Main Menu.",
+            reply_markup=main_menu_keyboard()
+        )
 
-        # Trigger background broadcast restricted to this user's sessions
-        asyncio.create_task(run_user_broadcast(
+        task = asyncio.create_task(run_user_broadcast(
             owner_id=user_id,
             target=target,
             text=promo_text,
-            photo_file_id=photo_file_id
+            photo_file_id=photo_file_id,
+            interval_minutes=interval_min
         ))
-
+        active_loops[user_id] = task
         user_states.pop(user_id, None)
-        await message.reply_text("🚀 **Broadcast started in background!** You will receive a summary when finished.", reply_markup=main_menu_keyboard())
 
 # ------------------------------------------------------------------
-# BROADCAST ENGINE (ISOLATED PER USER)
+# BROADCAST ENGINE (ISOLATED PER USER WITH SLOW MODE FIX)
 # ------------------------------------------------------------------
-async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_id: str = None):
-    my_accounts = user_sessions.get(owner_id, {})
-    total_sent = 0
-    total_failed = 0
+async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_id: str = None, interval_minutes: int = 0):
+    try:
+        while True:
+            my_accounts = user_sessions.get(owner_id, {})
+            total_sent = 0
+            total_failed = 0
 
-    local_photo_path = None
-    if photo_file_id:
-        local_photo_path = await bot.download_media(photo_file_id)
+            local_photo_path = None
+            if photo_file_id:
+                try:
+                    local_photo_path = await bot.download_media(photo_file_id)
+                except Exception as e:
+                    logger.error(f"Failed to download media: {e}")
 
-    for phone, session_str in my_accounts.items():
-        user_client = Client(f"user_{phone}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+            for phone, session_str in my_accounts.items():
+                user_client = Client(f"user_{phone}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
 
-        try:
-            await user_client.start()
+                try:
+                    await user_client.start()
 
-            async for dialog in user_client.get_dialogs():
-                chat_type = dialog.chat.type.value
-                should_send = False
-
-                if target == "promo_gc" and chat_type in ["group", "supergroup", "channel"]:
-                    should_send = True
-                elif target == "promo_dm" and chat_type == "private":
-                    should_send = True
-                elif target == "promo_both":
-                    should_send = True
-
-                if should_send:
-                    try:
-                        if local_photo_path:
-                            await user_client.send_photo(dialog.chat.id, photo=local_photo_path, caption=text)
-                        else:
-                            await user_client.send_message(dialog.chat.id, text=text)
+                    async for dialog in user_client.get_dialogs():
+                        chat = dialog.chat
+                        chat_type = str(chat.type).lower()
                         
-                        total_sent += 1
-                        await asyncio.sleep(2)  # Delay to avoid Telegram FloodWait
-                    except FloodWait as e:
-                        await asyncio.sleep(e.value)
-                    except Exception as err:
-                        logger.error(f"Error sending to {dialog.chat.id} via {phone}: {err}")
-                        total_failed += 1
+                        is_group_or_channel = any(k in chat_type for k in ["group", "supergroup", "channel"])
+                        is_private_dm = "private" in chat_type
 
-            await user_client.stop()
+                        should_send = False
 
-        except Exception as e:
-            logger.error(f"Execution error for account {phone}: {e}")
-            total_failed += 1
+                        if target == "promo_gc" and is_group_or_channel:
+                            should_send = True
+                        elif target == "promo_dm" and is_private_dm:
+                            should_send = True
+                        elif target == "promo_both" and (is_group_or_channel or is_private_dm):
+                            should_send = True
 
-    # Send report back only to the owner
-    await bot.send_message(
-        owner_id,
-        f"📊 **Broadcast Complete Summary**\n\n"
-        f"✅ **Messages Sent:** `{total_sent}`\n"
-        f"❌ **Failed Attempts:** `{total_failed}`",
-        reply_markup=main_menu_keyboard()
-    )
+                        if should_send:
+                            try:
+                                if local_photo_path:
+                                    await user_client.send_photo(chat.id, photo=local_photo_path, caption=text)
+                                else:
+                                    await user_client.send_message(chat.id, text=text)
+                                
+                                total_sent += 1
+                                await asyncio.sleep(2)  # Delay between chats to prevent flood
+                            
+                            except SlowmodeWait as e:
+                                logger.info(f"Slow Mode active in {chat.id}. Waiting for {e.value}s")
+                                await asyncio.sleep(e.value)
+                                # Retry once after waiting
+                                try:
+                                    if local_photo_path:
+                                        await user_client.send_photo(chat.id, photo=local_photo_path, caption=text)
+                                    else:
+                                        await user_client.send_message(chat.id, text=text)
+                                    total_sent += 1
+                                except Exception:
+                                    total_failed += 1
+                            
+                            except FloodWait as e:
+                                logger.info(f"FloodWait hit. Waiting {e.value}s")
+                                await asyncio.sleep(e.value)
+                            
+                            except Exception as err:
+                                logger.error(f"Failed to send to {chat.title or chat.id} via {phone}: {err}")
+                                total_failed += 1
+
+                    await user_client.stop()
+
+                except Exception as e:
+                    logger.error(f"Execution error for account {phone}: {e}")
+                    total_failed += 1
+
+            if local_photo_path and os.path.exists(local_photo_path):
+                os.remove(local_photo_path)
+
+            await bot.send_message(
+                owner_id,
+                f"📊 **Broadcast Completed Round Summary**\n\n"
+                f"✅ **Messages Sent:** `{total_sent}`\n"
+                f"❌ **Failed Attempts:** `{total_failed}`\n"
+                f"{f'🔁 **Next Round in:** `{interval_minutes}` minutes.' if interval_minutes > 0 else ''}",
+                reply_markup=main_menu_keyboard()
+            )
+
+            if interval_minutes <= 0:
+                break
+
+            await asyncio.sleep(interval_minutes * 60)
+
+    except asyncio.CancelledError:
+        logger.info(f"Broadcast loop stopped for user {owner_id}")
 
 # ------------------------------------------------------------------
 # ENTRY POINT
