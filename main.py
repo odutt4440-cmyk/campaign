@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 from io import BytesIO
@@ -15,7 +16,10 @@ from pyrogram.errors import (
     PasswordHashInvalid,
     FloodWait,
     SlowmodeWait,
-    MessageNotModified
+    MessageNotModified,
+    UserAlreadyParticipant,
+    InviteHashExpired,
+    InviteHashInvalid
 )
 
 # ------------------------------------------------------------------
@@ -30,7 +34,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Multi-Tenant In-Memory Storage
-user_sessions = {}
+user_sessions = {}      # { user_id: { phone: session_string } }
+user_custom_gcs = {}    # { user_id: [ chat_id_or_username_or_link, ... ] }
 
 # Workflow state tracker per user
 user_states = {}
@@ -48,6 +53,8 @@ def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("➕ Add Account", callback_data="add_account"),
          InlineKeyboardButton("👤 My Accounts", callback_data="my_accounts")],
+        [InlineKeyboardButton("➕ Add Custom GC", callback_data="add_gc"),
+         InlineKeyboardButton("📋 My Selected GCs", callback_data="my_gcs")],
         [InlineKeyboardButton("📢 Broadcast Promo", callback_data="broadcast_menu")],
         [InlineKeyboardButton("🛑 Stop Loop Broadcast", callback_data="stop_loop_broadcast")],
         [InlineKeyboardButton("❌ Cancel / Reset", callback_data="cancel_action")]
@@ -55,6 +62,7 @@ def main_menu_keyboard():
 
 def broadcast_type_keyboard():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎯 Selected Groups Only", callback_data="promo_custom")],
         [InlineKeyboardButton("💬 Promo in All GC", callback_data="promo_gc"),
          InlineKeyboardButton("📥 Promo in All DM", callback_data="promo_dm")],
         [InlineKeyboardButton("🚀 Promo in Both (GC + DM)", callback_data="promo_both")],
@@ -77,10 +85,10 @@ def loop_ask_keyboard():
 
 def loop_delay_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏱️ 10 Minutes (Standard GC Slow Mode)", callback_data="delay_10")],
-        [InlineKeyboardButton("⏱️ 15 Minutes (Safe Interval)", callback_data="delay_15")],
-        [InlineKeyboardButton("⏱️ 30 Minutes (Extended Gap)", callback_data="delay_30")],
-        [InlineKeyboardButton("✏️ Custom Time (Enter Manually)", callback_data="delay_custom")],
+        [InlineKeyboardButton("⏱️ 10 Minutes", callback_data="delay_10")],
+        [InlineKeyboardButton("⏱️ 15 Minutes", callback_data="delay_15")],
+        [InlineKeyboardButton("⏱️ 30 Minutes", callback_data="delay_30")],
+        [InlineKeyboardButton("✏️ Custom Time", callback_data="delay_custom")],
         [InlineKeyboardButton("⬅️ Cancel", callback_data="cancel_action")]
     ])
 
@@ -100,9 +108,9 @@ async def start_command(client: Client, message: Message):
     user_states.pop(user_id, None)
     await message.reply_text(
         "👋 **Welcome to Multi-Account Promo Automation Bot**\n\n"
-        "Here you can connect your Telegram accounts, download session files, "
-        "and securely send promotional messages across your joined groups and DMs.\n\n"
-        "🔒 **Privacy Guaranteed:** Your added accounts and sessions are visible ONLY to you.",
+        "Here you can connect your Telegram accounts, add specific target groups, "
+        "and broadcast messages across your groups and DMs.\n\n"
+        "🔒 **Privacy Guaranteed:** Your accounts and saved groups are visible ONLY to you.",
         reply_markup=main_menu_keyboard()
     )
 
@@ -136,7 +144,7 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
                 await callback.answer("ℹ️ No active loop broadcast found.", show_alert=True)
 
         # --------------------------------------------------------------
-        # MY ACCOUNTS (USER SPECIFIC ONLY)
+        # MY ACCOUNTS
         # --------------------------------------------------------------
         elif data == "add_account":
             user_states[user_id] = {"step": "AWAITING_PHONE"}
@@ -172,17 +180,13 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
             phone = data.replace("remove_acc_", "")
             if user_id in user_sessions and phone in user_sessions[user_id]:
                 del user_sessions[user_id][phone]
-                await callback.answer(f"Account {phone} removed successfully!", show_alert=True)
+                await callback.answer(f"Account {phone} removed!", show_alert=True)
             else:
                 await callback.answer("Account not found.", show_alert=True)
             
-            # Refresh My Accounts view directly without recursive callback calling
             my_accs = user_sessions.get(user_id, {})
             if not my_accs:
-                await callback.message.edit_text(
-                    "ℹ️ **You have no active accounts added.**",
-                    reply_markup=main_menu_keyboard()
-                )
+                await callback.message.edit_text("ℹ️ **You have no active accounts added.**", reply_markup=main_menu_keyboard())
             else:
                 buttons = []
                 for p in list(my_accs.keys()):
@@ -192,13 +196,70 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
                     ])
                 buttons.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")])
                 await callback.message.edit_text(
-                    f"📋 **Your Connected Accounts ({len(my_accs)}):**\n"
-                    "Click 'Remove' to delete your session.",
+                    f"📋 **Your Connected Accounts ({len(my_accs)}):**\nClick 'Remove' to delete your session.",
                     reply_markup=InlineKeyboardMarkup(buttons)
                 )
 
         # --------------------------------------------------------------
-        # BROADCAST WORKFLOW (USER SPECIFIC ONLY)
+        # ADD & MANAGE CUSTOM TARGET GROUPS
+        # --------------------------------------------------------------
+        elif data == "add_gc":
+            user_states[user_id] = {"step": "AWAITING_GC_INPUT"}
+            await callback.message.edit_text(
+                "➕ **Add Target Group**\n\n"
+                "Send the Group details in any of the following formats:\n"
+                "1. **Username:** `@mygroupusername`\n"
+                "2. **Invite Link:** `https://t.me/+AbCdEfGhIjKlMnOp`\n"
+                "3. **Chat ID:** `-1001234567890`"
+            )
+
+        elif data == "my_gcs":
+            my_gcs = user_custom_gcs.get(user_id, [])
+            if not my_gcs:
+                await callback.message.edit_text(
+                    "ℹ️ **You have no custom groups added.**",
+                    reply_markup=main_menu_keyboard()
+                )
+                return
+
+            buttons = []
+            for idx, gc_item in enumerate(my_gcs):
+                buttons.append([
+                    InlineKeyboardButton(f"👥 {gc_item}", callback_data=f"gc_info_{idx}"),
+                    InlineKeyboardButton("❌ Remove", callback_data=f"remove_gc_{idx}")
+                ])
+            buttons.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")])
+
+            await callback.message.edit_text(
+                f"📋 **Your Selected Target Groups ({len(my_gcs)}):**\n"
+                "Click 'Remove' to delete a group from your broadcast list.",
+                reply_markup=InlineKeyboardMarkup(buttons)
+            )
+
+        elif data.startswith("remove_gc_"):
+            idx = int(data.replace("remove_gc_", ""))
+            if user_id in user_custom_gcs and 0 <= idx < len(user_custom_gcs[user_id]):
+                removed_item = user_custom_gcs[user_id].pop(idx)
+                await callback.answer(f"Removed {removed_item}!", show_alert=True)
+            
+            my_gcs = user_custom_gcs.get(user_id, [])
+            if not my_gcs:
+                await callback.message.edit_text("ℹ️ **You have no custom groups added.**", reply_markup=main_menu_keyboard())
+            else:
+                buttons = []
+                for i, gc_item in enumerate(my_gcs):
+                    buttons.append([
+                        InlineKeyboardButton(f"👥 {gc_item}", callback_data=f"gc_info_{i}"),
+                        InlineKeyboardButton("❌ Remove", callback_data=f"remove_gc_{i}")
+                    ])
+                buttons.append([InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")])
+                await callback.message.edit_text(
+                    f"📋 **Your Selected Target Groups ({len(my_gcs)}):**",
+                    reply_markup=InlineKeyboardMarkup(buttons)
+                )
+
+        # --------------------------------------------------------------
+        # BROADCAST WORKFLOW
         # --------------------------------------------------------------
         elif data == "broadcast_menu":
             my_accs = user_sessions.get(user_id, {})
@@ -211,9 +272,14 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
                 reply_markup=broadcast_type_keyboard()
             )
 
-        elif data in ["promo_gc", "promo_dm", "promo_both"]:
+        elif data in ["promo_custom", "promo_gc", "promo_dm", "promo_both"]:
+            if data == "promo_custom" and not user_custom_gcs.get(user_id):
+                await callback.answer("⚠️ You haven't added any custom groups yet! Click 'Add Custom GC' first.", show_alert=True)
+                return
+
             target_map = {
-                "promo_gc": "Groups & Channels",
+                "promo_custom": "Selected Groups Only",
+                "promo_gc": "All Joined Groups & Channels",
                 "promo_dm": "Direct Messages (DMs)",
                 "promo_both": "Groups, Channels & DMs"
             }
@@ -240,7 +306,7 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
                 await callback.message.edit_text("📝 Send your **Promo Text Message** (Emojis & formatting supported).")
 
         # --------------------------------------------------------------
-        # LOOP & TIME INTERVAL SELECTION
+        # LOOP & TIME SELECTION
         # --------------------------------------------------------------
         elif data == "loop_no":
             if user_id in user_states:
@@ -264,11 +330,7 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
         elif data == "loop_yes":
             if user_id in user_states:
                 await callback.message.edit_text(
-                    "⏱️ **Select Delay Interval for Continuous Loop Broadcast:**\n\n"
-                    "• **10 Minutes:** Ideal interval to bypass Standard Slow Mode.\n"
-                    "• **15 Minutes:** Safer spacing between consecutive posts.\n"
-                    "• **30 Minutes:** Extended gap to prevent flood restrictions.\n"
-                    "• **Custom Time:** Enter delay manually in minutes.",
+                    "⏱️ **Select Delay Interval for Continuous Loop Broadcast:**",
                     reply_markup=loop_delay_keyboard()
                 )
 
@@ -302,7 +364,6 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
                 user_states.pop(user_id, None)
 
     except MessageNotModified:
-        # Ignore error if message content is identical
         pass
 
 # ------------------------------------------------------------------
@@ -318,14 +379,13 @@ async def handle_inputs(client: Client, message: Message):
 
     step = state.get("step")
 
-    # Helper function to assign session to specific user and send file
+    # Helper function to save session string
     async def complete_login_and_send_file(phone: str, session_string: str):
         if user_id not in user_sessions:
             user_sessions[user_id] = {}
         
         user_sessions[user_id][phone] = session_string
 
-        # Generate downloadable file
         file_bytes = BytesIO(session_string.encode("utf-8"))
         file_bytes.name = f"{phone}_session.string"
 
@@ -334,8 +394,8 @@ async def handle_inputs(client: Client, message: Message):
             caption=(
                 f"✅ **Account Logged In Successfully!**\n\n"
                 f"📱 **Phone:** `{phone}`\n"
-                f"📂 **Session File:** Attached above. You can download and save it.\n\n"
-                f"Your account is now ready to use under **My Accounts**."
+                f"📂 **Session File:** Attached above.\n\n"
+                f"Your account is now ready to use."
             ),
             reply_markup=main_menu_keyboard()
         )
@@ -407,7 +467,25 @@ async def handle_inputs(client: Client, message: Message):
             await message.reply_text(f"❌ Login failed: `{str(e)}`", reply_markup=main_menu_keyboard())
             user_states.pop(user_id, None)
 
-    # 4. Capture Photo
+    # 4. Add Custom Target Group
+    elif step == "AWAITING_GC_INPUT":
+        gc_input = message.text.strip()
+        if user_id not in user_custom_gcs:
+            user_custom_gcs[user_id] = []
+
+        if gc_input in user_custom_gcs[user_id]:
+            await message.reply_text("⚠️ This group is already in your selected list!", reply_markup=main_menu_keyboard())
+        else:
+            user_custom_gcs[user_id].append(gc_input)
+            await message.reply_text(
+                f"✅ **Target Group Added Successfully!**\n\n"
+                f"📌 **Target:** `{gc_input}`\n"
+                f"Total Saved Groups: `{len(user_custom_gcs[user_id])}`",
+                reply_markup=main_menu_keyboard()
+            )
+        user_states.pop(user_id, None)
+
+    # 5. Capture Photo
     elif step == "AWAITING_PHOTO":
         if not message.photo:
             await message.reply_text("❌ Please send a valid **photo**.")
@@ -417,7 +495,7 @@ async def handle_inputs(client: Client, message: Message):
         user_states[user_id]["step"] = "AWAITING_TEXT"
         await message.reply_text("📝 Photo saved! Now send your **Promo Text Message / Caption**.")
 
-    # 5. Capture Text & Ask Loop Preference
+    # 6. Capture Text
     elif step == "AWAITING_TEXT":
         promo_text = message.text or message.caption or ""
         user_states[user_id]["promo_text"] = promo_text
@@ -429,10 +507,10 @@ async def handle_inputs(client: Client, message: Message):
             reply_markup=loop_ask_keyboard()
         )
 
-    # 6. Custom Delay Input
+    # 7. Custom Delay Input
     elif step == "AWAITING_CUSTOM_DELAY":
         if not message.text.isdigit() or int(message.text) <= 0:
-            await message.reply_text("❌ Invalid duration! Please enter a positive number in minutes (e.g., `12`).")
+            await message.reply_text("❌ Invalid duration! Please enter a positive number in minutes (e.g. `12`).")
             return
 
         interval_min = int(message.text)
@@ -458,13 +536,51 @@ async def handle_inputs(client: Client, message: Message):
         user_states.pop(user_id, None)
 
 # ------------------------------------------------------------------
-# BROADCAST ENGINE (FIXED FOR TOPICS/FORUMS & CHAT PERMISSIONS)
+# AUTO-JOIN HELPER FOR CUSTOM GROUPS
 # ------------------------------------------------------------------
+async def ensure_group_joined(client: Client, gc_target: str) -> str:
+    """Checks if the account is in the group. If not, auto-joins via link/username."""
+    target_clean = gc_target.strip()
+    
+    # 1. Invite Link Handling (e.g., https://t.me/+AbCdEf... or https://t.me/joinchat/...)
+    if "joinchat/" in target_clean or "t.me/+" in target_clean or "t.me/joinchat/" in target_clean:
+        try:
+            chat = await client.join_chat(target_clean)
+            return chat.id
+        except UserAlreadyParticipant:
+            # Get entity ID if already joined
+            chat = await client.get_chat(target_clean)
+            return chat.id
+        except Exception as e:
+            logger.error(f"Failed to join via invite link {target_clean}: {e}")
+            raise e
 
+    # 2. Username or Chat ID Handling
+    else:
+        # Convert numeric string to integer chat_id if applicable
+        if target_clean.startswith("-100") or target_clean.lstrip('-').isdigit():
+            target_clean = int(target_clean)
+
+        try:
+            chat = await client.get_chat(target_clean)
+            return chat.id
+        except Exception:
+            # If get_chat fails, try joining if it's a username
+            try:
+                chat = await client.join_chat(target_clean)
+                return chat.id
+            except Exception as join_err:
+                logger.error(f"Failed to fetch/join target {target_clean}: {join_err}")
+                raise join_err
+
+# ------------------------------------------------------------------
+# BROADCAST ENGINE
+# ------------------------------------------------------------------
 async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_id: str = None, interval_minutes: int = 0):
     try:
         while True:
             my_accounts = user_sessions.get(owner_id, {})
+            custom_gcs = user_custom_gcs.get(owner_id, [])
             total_sent = 0
             total_failed = 0
 
@@ -481,52 +597,91 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                 try:
                     await user_client.start()
 
-                    async for dialog in user_client.get_dialogs():
-                        chat = dialog.chat
-                        chat_type = str(chat.type).lower()
-                        
-                        is_group_or_channel = any(k in chat_type for k in ["group", "supergroup", "channel"])
-                        is_private_dm = "private" in chat_type
-
-                        should_send = False
-
-                        if target == "promo_gc" and is_group_or_channel:
-                            should_send = True
-                        elif target == "promo_dm" and is_private_dm:
-                            should_send = True
-                        elif target == "promo_both" and (is_group_or_channel or is_private_dm):
-                            should_send = True
-
-                        if should_send:
+                    # ------------------------------------------------------
+                    # MODE A: SELECTED GROUPS ONLY (MANUAL TARGETING)
+                    # ------------------------------------------------------
+                    if target == "promo_custom":
+                        for gc_item in custom_gcs:
                             try:
+                                target_chat_id = await ensure_group_joined(user_client, gc_item)
+
                                 if local_photo_path:
-                                    await user_client.send_photo(chat.id, photo=local_photo_path, caption=text)
+                                    await user_client.send_photo(target_chat_id, photo=local_photo_path, caption=text)
                                 else:
-                                    await user_client.send_message(chat.id, text=text)
-                                
+                                    await user_client.send_message(target_chat_id, text=text)
+
                                 total_sent += 1
-                                await asyncio.sleep(2)  # Delay between chats to prevent flood
-                            
+                                await asyncio.sleep(2)
+
                             except SlowmodeWait as e:
-                                logger.info(f"Slow Mode active in {chat.id}. Waiting for {e.value}s")
+                                logger.info(f"Slow Mode active in {gc_item}. Waiting {e.value}s")
                                 await asyncio.sleep(e.value)
+                                try:
+                                    if local_photo_path:
+                                        await user_client.send_photo(target_chat_id, photo=local_photo_path, caption=text)
+                                    else:
+                                        await user_client.send_message(target_chat_id, text=text)
+                                    total_sent += 1
+                                except Exception:
+                                    total_failed += 1
+
+                            except FloodWait as e:
+                                logger.info(f"FloodWait hit. Waiting {e.value}s")
+                                await asyncio.sleep(e.value)
+
+                            except Exception as err:
+                                logger.error(f"Failed sending to {gc_item} via {phone}: {err}")
+                                total_failed += 1
+
+                    # ------------------------------------------------------
+                    # MODE B: ALL JOINED DIALOGS (GC / DM / BOTH)
+                    # ------------------------------------------------------
+                    else:
+                        async for dialog in user_client.get_dialogs():
+                            chat = dialog.chat
+                            chat_type = str(chat.type).lower()
+                            
+                            is_group_or_channel = any(k in chat_type for k in ["group", "supergroup", "channel"])
+                            is_private_dm = "private" in chat_type
+
+                            should_send = False
+
+                            if target == "promo_gc" and is_group_or_channel:
+                                should_send = True
+                            elif target == "promo_dm" and is_private_dm:
+                                should_send = True
+                            elif target == "promo_both" and (is_group_or_channel or is_private_dm):
+                                should_send = True
+
+                            if should_send:
                                 try:
                                     if local_photo_path:
                                         await user_client.send_photo(chat.id, photo=local_photo_path, caption=text)
                                     else:
                                         await user_client.send_message(chat.id, text=text)
+                                    
                                     total_sent += 1
-                                except Exception:
+                                    await asyncio.sleep(2)
+                                
+                                except SlowmodeWait as e:
+                                    logger.info(f"Slow Mode active in {chat.id}. Waiting {e.value}s")
+                                    await asyncio.sleep(e.value)
+                                    try:
+                                        if local_photo_path:
+                                            await user_client.send_photo(chat.id, photo=local_photo_path, caption=text)
+                                        else:
+                                            await user_client.send_message(chat.id, text=text)
+                                        total_sent += 1
+                                    except Exception:
+                                        total_failed += 1
+                                
+                                except FloodWait as e:
+                                    logger.info(f"FloodWait hit. Waiting {e.value}s")
+                                    await asyncio.sleep(e.value)
+                                
+                                except Exception as err:
+                                    logger.error(f"Failed sending to {chat.title or chat.id} via {phone}: {err}")
                                     total_failed += 1
-                            
-                            except FloodWait as e:
-                                logger.info(f"FloodWait hit. Waiting {e.value}s")
-                                await asyncio.sleep(e.value)
-                            
-                            except Exception as err:
-                                # Skips chats where posting isn't allowed (e.g. admin-only channels or closed groups)
-                                logger.error(f"Failed to send to {chat.title or chat.id} via {phone}: {err}")
-                                total_failed += 1
 
                     await user_client.stop()
 
