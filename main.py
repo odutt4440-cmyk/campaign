@@ -19,7 +19,11 @@ from pyrogram.errors import (
     MessageNotModified,
     UserAlreadyParticipant,
     InviteHashExpired,
-    InviteHashInvalid
+    InviteHashInvalid,
+    ChatWriteForbidden,
+    UserBannedInChannel,
+    PeerIdInvalid,
+    RPCError
 )
 
 # ------------------------------------------------------------------
@@ -143,9 +147,6 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
             else:
                 await callback.answer("ℹ️ No active loop broadcast found.", show_alert=True)
 
-        # --------------------------------------------------------------
-        # MY ACCOUNTS
-        # --------------------------------------------------------------
         elif data == "add_account":
             user_states[user_id] = {"step": "AWAITING_PHONE"}
             await callback.message.edit_text(
@@ -200,9 +201,6 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
                     reply_markup=InlineKeyboardMarkup(buttons)
                 )
 
-        # --------------------------------------------------------------
-        # ADD & MANAGE CUSTOM TARGET GROUPS
-        # --------------------------------------------------------------
         elif data == "add_gc":
             user_states[user_id] = {"step": "AWAITING_GC_INPUT"}
             await callback.message.edit_text(
@@ -258,9 +256,6 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
                     reply_markup=InlineKeyboardMarkup(buttons)
                 )
 
-        # --------------------------------------------------------------
-        # BROADCAST WORKFLOW
-        # --------------------------------------------------------------
         elif data == "broadcast_menu":
             my_accs = user_sessions.get(user_id, {})
             if not my_accs:
@@ -305,9 +300,6 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
                 user_states[user_id]["step"] = "AWAITING_TEXT"
                 await callback.message.edit_text("📝 Send your **Promo Text Message** (Emojis & formatting supported).")
 
-        # --------------------------------------------------------------
-        # LOOP & TIME SELECTION
-        # --------------------------------------------------------------
         elif data == "loop_no":
             if user_id in user_states:
                 state = user_states[user_id]
@@ -379,7 +371,7 @@ async def handle_inputs(client: Client, message: Message):
 
     step = state.get("step")
 
-    # Helper function to save session string
+    # Helper function to save session string with instructions & warning
     async def complete_login_and_send_file(phone: str, session_string: str):
         if user_id not in user_sessions:
             user_sessions[user_id] = {}
@@ -395,13 +387,15 @@ async def handle_inputs(client: Client, message: Message):
                 f"✅ **Account Logged In Successfully!**\n\n"
                 f"📱 **Phone:** `{phone}`\n"
                 f"📂 **Session File:** Attached above.\n\n"
-                f"Your account is now ready to use."
+                f"⚠️ **IMPORTANT SECURITY NOTICE:**\n"
+                f"• This file gives full access to your account. **DO NOT SHARE IT WITH ANYONE!**\n"
+                f"• This session file is generated **ONLY ONCE** for safety.\n"
+                f"• You can download and save this file to reuse this session in other bots or scripts."
             ),
             reply_markup=main_menu_keyboard()
         )
         user_states.pop(user_id, None)
 
-    # 1. Add Phone
     if step == "AWAITING_PHONE":
         phone = message.text.strip()
         temp_client = Client("temp_session", api_id=API_ID, api_hash=API_HASH, in_memory=True)
@@ -420,7 +414,6 @@ async def handle_inputs(client: Client, message: Message):
             await message.reply_text(f"❌ Failed to send OTP: `{str(e)}`", reply_markup=main_menu_keyboard())
             user_states.pop(user_id, None)
 
-    # 2. Add OTP Code
     elif step == "AWAITING_OTP":
         otp = message.text.replace(" ", "").strip()
         temp_client = state["temp_client"]
@@ -446,7 +439,6 @@ async def handle_inputs(client: Client, message: Message):
             await message.reply_text(f"❌ Login failed: `{str(e)}`", reply_markup=main_menu_keyboard())
             user_states.pop(user_id, None)
 
-    # 3. Add 2FA Password
     elif step == "AWAITING_2FA":
         password = message.text.strip()
         temp_client = state["temp_client"]
@@ -467,7 +459,6 @@ async def handle_inputs(client: Client, message: Message):
             await message.reply_text(f"❌ Login failed: `{str(e)}`", reply_markup=main_menu_keyboard())
             user_states.pop(user_id, None)
 
-    # 4. Add Custom Target Group
     elif step == "AWAITING_GC_INPUT":
         gc_input = message.text.strip()
         if user_id not in user_custom_gcs:
@@ -485,7 +476,6 @@ async def handle_inputs(client: Client, message: Message):
             )
         user_states.pop(user_id, None)
 
-    # 5. Capture Photo
     elif step == "AWAITING_PHOTO":
         if not message.photo:
             await message.reply_text("❌ Please send a valid **photo**.")
@@ -495,7 +485,6 @@ async def handle_inputs(client: Client, message: Message):
         user_states[user_id]["step"] = "AWAITING_TEXT"
         await message.reply_text("📝 Photo saved! Now send your **Promo Text Message / Caption**.")
 
-    # 6. Capture Text
     elif step == "AWAITING_TEXT":
         promo_text = message.text or message.caption or ""
         user_states[user_id]["promo_text"] = promo_text
@@ -507,7 +496,6 @@ async def handle_inputs(client: Client, message: Message):
             reply_markup=loop_ask_keyboard()
         )
 
-    # 7. Custom Delay Input
     elif step == "AWAITING_CUSTOM_DELAY":
         if not message.text.isdigit() or int(message.text) <= 0:
             await message.reply_text("❌ Invalid duration! Please enter a positive number in minutes (e.g. `12`).")
@@ -542,22 +530,17 @@ async def ensure_group_joined(client: Client, gc_target: str) -> str:
     """Checks if the account is in the group. If not, auto-joins via link/username."""
     target_clean = gc_target.strip()
     
-    # 1. Invite Link Handling (e.g., https://t.me/+AbCdEf... or https://t.me/joinchat/...)
     if "joinchat/" in target_clean or "t.me/+" in target_clean or "t.me/joinchat/" in target_clean:
         try:
             chat = await client.join_chat(target_clean)
             return chat.id
         except UserAlreadyParticipant:
-            # Get entity ID if already joined
             chat = await client.get_chat(target_clean)
             return chat.id
         except Exception as e:
             logger.error(f"Failed to join via invite link {target_clean}: {e}")
             raise e
-
-    # 2. Username or Chat ID Handling
     else:
-        # Convert numeric string to integer chat_id if applicable
         if target_clean.startswith("-100") or target_clean.lstrip('-').isdigit():
             target_clean = int(target_clean)
 
@@ -565,7 +548,6 @@ async def ensure_group_joined(client: Client, gc_target: str) -> str:
             chat = await client.get_chat(target_clean)
             return chat.id
         except Exception:
-            # If get_chat fails, try joining if it's a username
             try:
                 chat = await client.join_chat(target_clean)
                 return chat.id
@@ -574,7 +556,7 @@ async def ensure_group_joined(client: Client, gc_target: str) -> str:
                 raise join_err
 
 # ------------------------------------------------------------------
-# BROADCAST ENGINE
+# BROADCAST ENGINE WITH DETAILED FAILURE REASONS
 # ------------------------------------------------------------------
 async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_id: str = None, interval_minutes: int = 0):
     try:
@@ -582,7 +564,7 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
             my_accounts = user_sessions.get(owner_id, {})
             custom_gcs = user_custom_gcs.get(owner_id, [])
             total_sent = 0
-            total_failed = 0
+            failed_reasons = []  # Detailed failure list
 
             local_photo_path = None
             if photo_file_id:
@@ -598,7 +580,7 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                     await user_client.start()
 
                     # ------------------------------------------------------
-                    # MODE A: SELECTED GROUPS ONLY (MANUAL TARGETING)
+                    # MODE A: SELECTED GROUPS ONLY
                     # ------------------------------------------------------
                     if target == "promo_custom":
                         for gc_item in custom_gcs:
@@ -622,16 +604,27 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                                     else:
                                         await user_client.send_message(target_chat_id, text=text)
                                     total_sent += 1
-                                except Exception:
-                                    total_failed += 1
+                                except Exception as err:
+                                    failed_reasons.append(f"• **{gc_item}** ({phone}): `{type(err).__name__}`")
 
                             except FloodWait as e:
                                 logger.info(f"FloodWait hit. Waiting {e.value}s")
                                 await asyncio.sleep(e.value)
 
+                            except ChatWriteForbidden:
+                                failed_reasons.append(f"• **{gc_item}** ({phone}): Permission Denied (Muted/Read-Only)")
+                            except UserBannedInChannel:
+                                failed_reasons.append(f"• **{gc_item}** ({phone}): Account Banned in Group")
+                            except PeerIdInvalid:
+                                failed_reasons.append(f"• **{gc_item}** ({phone}): Invalid Chat/Username")
+                            except InviteHashExpired:
+                                failed_reasons.append(f"• **{gc_item}** ({phone}): Invite Link Expired")
+                            except InviteHashInvalid:
+                                failed_reasons.append(f"• **{gc_item}** ({phone}): Invalid Invite Link")
+                            except RPCError as err:
+                                failed_reasons.append(f"• **{gc_item}** ({phone}): `{err.MESSAGE or type(err).__name__}`")
                             except Exception as err:
-                                logger.error(f"Failed sending to {gc_item} via {phone}: {err}")
-                                total_failed += 1
+                                failed_reasons.append(f"• **{gc_item}** ({phone}): `{str(err)}`")
 
                     # ------------------------------------------------------
                     # MODE B: ALL JOINED DIALOGS (GC / DM / BOTH)
@@ -640,6 +633,7 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                         async for dialog in user_client.get_dialogs():
                             chat = dialog.chat
                             chat_type = str(chat.type).lower()
+                            chat_name = chat.title or chat.first_name or f"ID: {chat.id}"
                             
                             is_group_or_channel = any(k in chat_type for k in ["group", "supergroup", "channel"])
                             is_private_dm = "private" in chat_type
@@ -672,34 +666,51 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                                         else:
                                             await user_client.send_message(chat.id, text=text)
                                         total_sent += 1
-                                    except Exception:
-                                        total_failed += 1
+                                    except Exception as err:
+                                        failed_reasons.append(f"• **{chat_name}** ({phone}): `{type(err).__name__}`")
                                 
                                 except FloodWait as e:
                                     logger.info(f"FloodWait hit. Waiting {e.value}s")
                                     await asyncio.sleep(e.value)
                                 
+                                except ChatWriteForbidden:
+                                    failed_reasons.append(f"• **{chat_name}** ({phone}): Permission Denied (Muted/Read-Only)")
+                                except UserBannedInChannel:
+                                    failed_reasons.append(f"• **{chat_name}** ({phone}): Account Banned in Group")
+                                except PeerIdInvalid:
+                                    failed_reasons.append(f"• **{chat_name}** ({phone}): Invalid Chat/User")
+                                except RPCError as err:
+                                    failed_reasons.append(f"• **{chat_name}** ({phone}): `{err.MESSAGE or type(err).__name__}`")
                                 except Exception as err:
-                                    logger.error(f"Failed sending to {chat.title or chat.id} via {phone}: {err}")
-                                    total_failed += 1
+                                    failed_reasons.append(f"• **{chat_name}** ({phone}): `{str(err)}`")
 
                     await user_client.stop()
 
                 except Exception as e:
                     logger.error(f"Execution error for account {phone}: {e}")
-                    total_failed += 1
+                    failed_reasons.append(f"• **Account {phone}**: Login/Connection Failed (`{type(e).__name__}`)")
 
             if local_photo_path and os.path.exists(local_photo_path):
                 os.remove(local_photo_path)
 
-            await bot.send_message(
-                owner_id,
+            # Build Summary Message
+            summary_msg = (
                 f"📊 **Broadcast Completed Round Summary**\n\n"
                 f"✅ **Messages Sent:** `{total_sent}`\n"
-                f"❌ **Failed Attempts:** `{total_failed}`\n"
-                f"{f'🔁 **Next Round in:** `{interval_minutes}` minutes.' if interval_minutes > 0 else ''}",
-                reply_markup=main_menu_keyboard()
+                f"❌ **Failed Attempts:** `{len(failed_reasons)}`"
             )
+
+            if failed_reasons:
+                summary_msg += "\n\n⚠️ **Failure Reasons:**\n"
+                # Telegram message length limit handle karne ke liye (max 15 items show karo)
+                summary_msg += "\n".join(failed_reasons[:15])
+                if len(failed_reasons) > 15:
+                    summary_msg += f"\n...and {len(failed_reasons) - 15} more failures."
+
+            if interval_minutes > 0:
+                summary_msg += f"\n\n🔁 **Next Round in:** `{interval_minutes}` minutes."
+
+            await bot.send_message(owner_id, summary_msg, reply_markup=main_menu_keyboard())
 
             if interval_minutes <= 0:
                 break
