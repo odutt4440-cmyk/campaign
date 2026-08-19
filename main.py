@@ -69,11 +69,14 @@ def main_menu_keyboard():
 
 def broadcast_type_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎯 Selected Groups Only", callback_data="promo_custom_gc"),
-         InlineKeyboardButton("🎯 Selected DMs Only", callback_data="promo_custom_dm")],
-        [InlineKeyboardButton("💬 Promo in All GC", callback_data="promo_gc"),
-         InlineKeyboardButton("📥 Promo in All DM", callback_data="promo_dm")],
-        [InlineKeyboardButton("🚀 Promo in Both (GC + DM)", callback_data="promo_both")],
+        [InlineKeyboardButton("🎯 Selected GC Only", callback_data="promo_custom_gc"),
+         InlineKeyboardButton("🎯 Selected DM Only", callback_data="promo_custom_dm")],
+        [InlineKeyboardButton("💬 All GC Only", callback_data="promo_gc"),
+         InlineKeyboardButton("📥 All DM Only", callback_data="promo_dm")],
+        [InlineKeyboardButton("⚡ Selected GC + Selected DM", callback_data="combo_sel_gc_sel_dm")],
+        [InlineKeyboardButton("🚀 Selected GC + All DM", callback_data="combo_sel_gc_all_dm")],
+        [InlineKeyboardButton("💥 All GC + Selected DM", callback_data="combo_all_gc_sel_dm")],
+        [InlineKeyboardButton("🌐 All GC + All DM", callback_data="combo_all_gc_all_dm")],
         [InlineKeyboardButton("⬅️ Back to Main Menu", callback_data="main_menu")]
     ])
 
@@ -256,7 +259,6 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
                     reply_markup=InlineKeyboardMarkup(buttons)
                 )
 
-        # ---------------- ADDED: SELECTED DM MANAGEMENT ----------------
         elif data == "add_dm":
             user_states[user_id] = {"step": "AWAITING_DM_INPUT"}
             await callback.message.edit_text(
@@ -317,19 +319,19 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
                 return
             
             await callback.message.edit_text(
-                "📢 **Select Broadcast Destination:**",
+                "📢 **Select Broadcast Destination / Combination:**",
                 reply_markup=broadcast_type_keyboard()
             )
 
-        elif data in ["promo_custom_gc", "promo_custom_dm", "promo_gc", "promo_dm", "promo_both"]:
-            if data == "promo_custom_gc" and not user_custom_gcs.get(user_id):
-                await callback.answer("⚠️ You haven't added any custom groups yet!", show_alert=True)
+        elif data in [
+            "promo_custom_gc", "promo_custom_dm", "promo_gc", "promo_dm",
+            "combo_sel_gc_sel_dm", "combo_sel_gc_all_dm", "combo_all_gc_sel_dm", "combo_all_gc_all_dm"
+        ]:
+            if data in ["promo_custom_gc", "combo_sel_gc_sel_dm", "combo_sel_gc_all_dm"] and not user_custom_gcs.get(user_id):
+                await callback.answer("⚠️ You haven't added any selected groups yet!", show_alert=True)
                 return
-            if data == "promo_custom_dm" and not user_custom_dms.get(user_id):
-                await callback.answer("⚠️ You haven't added any custom DM users yet!", show_alert=True)
-                return
-            if data == "promo_both" and not user_custom_gcs.get(user_id) and not user_custom_dms.get(user_id):
-                await callback.answer("⚠️ Please add at least one custom group or custom DM target!", show_alert=True)
+            if data in ["promo_custom_dm", "combo_sel_gc_sel_dm", "combo_all_gc_sel_dm"] and not user_custom_dms.get(user_id):
+                await callback.answer("⚠️ You haven't added any selected DM users yet!", show_alert=True)
                 return
 
             target_map = {
@@ -337,14 +339,17 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
                 "promo_custom_dm": "Selected DMs Only",
                 "promo_gc": "All Joined Groups & Channels",
                 "promo_dm": "All Active DMs",
-                "promo_both": "Selected Groups + Selected DMs"
+                "combo_sel_gc_sel_dm": "Selected GCs + Selected DMs",
+                "combo_sel_gc_all_dm": "Selected GCs + All Active DMs",
+                "combo_all_gc_sel_dm": "All Joined GCs + Selected DMs",
+                "combo_all_gc_all_dm": "All Joined GCs + All Active DMs"
             }
             user_states[user_id] = {
                 "step": "AWAITING_MEDIA_CHOICE",
                 "target": data
             }
             await callback.message.edit_text(
-                f"🎯 **Target:** {target_map[data]}\n\n"
+                f"🎯 **Target Mode:** {target_map[data]}\n\n"
                 "❓ **Do you want to add a photo with your message?**",
                 reply_markup=media_choice_keyboard()
             )
@@ -632,7 +637,7 @@ async def ensure_group_joined(client: Client, gc_target: str) -> str:
                 raise join_err
 
 # ------------------------------------------------------------------
-# BROADCAST ENGINE WITH DETAILED FAILURE REASONS
+# BROADCAST ENGINE WITH MATRIX COMBINATIONS & DETAILED FAILURE REASONS
 # ------------------------------------------------------------------
 async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_id: str = None, interval_minutes: int = 0):
     try:
@@ -656,8 +661,8 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                 try:
                     await user_client.start()
 
-                    # MODE A: SELECTED GROUPS ONLY OR BOTH (GC PORTION)
-                    if target in ["promo_custom_gc", "promo_both"]:
+                    # 1. SELECTED GROUPS PORTION
+                    if target in ["promo_custom_gc", "combo_sel_gc_sel_dm", "combo_sel_gc_all_dm"]:
                         for gc_item in custom_gcs:
                             try:
                                 target_chat_id = await ensure_group_joined(user_client, gc_item)
@@ -694,8 +699,8 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                             except Exception as err:
                                 failed_reasons.append(f"• **{gc_item}** ({phone}): `{str(err)}`")
 
-                    # MODE B: SELECTED DMs ONLY OR BOTH (DM PORTION)
-                    if target in ["promo_custom_dm", "promo_both"]:
+                    # 2. SELECTED DMs PORTION
+                    if target in ["promo_custom_dm", "combo_sel_gc_sel_dm", "combo_all_gc_sel_dm"]:
                         for dm_item in custom_dms:
                             try:
                                 dm_clean = dm_item.strip()
@@ -718,8 +723,8 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                             except Exception as err:
                                 failed_reasons.append(f"• **{dm_item}** ({phone}): `{str(err)}`")
 
-                    # MODE C: ALL JOINED DIALOGS (GC / DM)
-                    if target in ["promo_gc", "promo_dm"]:
+                    # 3. DIALOG ITERATION PORTION (ALL GCs / ALL DMs)
+                    if target in ["promo_gc", "promo_dm", "combo_sel_gc_all_dm", "combo_all_gc_sel_dm", "combo_all_gc_all_dm"]:
                         async for dialog in user_client.get_dialogs():
                             chat = dialog.chat
                             chat_type = str(chat.type).lower()
@@ -730,9 +735,12 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
 
                             should_send = False
 
-                            if target == "promo_gc" and is_group_or_channel:
+                            # Group filtering
+                            if is_group_or_channel and target in ["promo_gc", "combo_all_gc_sel_dm", "combo_all_gc_all_dm"]:
                                 should_send = True
-                            elif target == "promo_dm" and is_private_dm:
+
+                            # DM filtering
+                            if is_private_dm and target in ["promo_dm", "combo_sel_gc_all_dm", "combo_all_gc_all_dm"]:
                                 should_send = True
 
                             if should_send:
