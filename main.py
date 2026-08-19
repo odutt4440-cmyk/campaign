@@ -328,13 +328,16 @@ async def handle_callbacks(client: Client, callback: CallbackQuery):
             if data == "promo_custom_dm" and not user_custom_dms.get(user_id):
                 await callback.answer("⚠️ You haven't added any custom DM users yet!", show_alert=True)
                 return
+            if data == "promo_both" and not user_custom_gcs.get(user_id) and not user_custom_dms.get(user_id):
+                await callback.answer("⚠️ Please add at least one custom group or custom DM target!", show_alert=True)
+                return
 
             target_map = {
                 "promo_custom_gc": "Selected Groups Only",
                 "promo_custom_dm": "Selected DMs Only",
                 "promo_gc": "All Joined Groups & Channels",
                 "promo_dm": "All Active DMs",
-                "promo_both": "Groups, Channels & DMs"
+                "promo_both": "Selected Groups + Selected DMs"
             }
             user_states[user_id] = {
                 "step": "AWAITING_MEDIA_CHOICE",
@@ -653,8 +656,8 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                 try:
                     await user_client.start()
 
-                    # MODE A: SELECTED GROUPS ONLY
-                    if target == "promo_custom_gc":
+                    # MODE A: SELECTED GROUPS ONLY OR BOTH (GC PORTION)
+                    if target in ["promo_custom_gc", "promo_both"]:
                         for gc_item in custom_gcs:
                             try:
                                 target_chat_id = await ensure_group_joined(user_client, gc_item)
@@ -691,11 +694,12 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                             except Exception as err:
                                 failed_reasons.append(f"• **{gc_item}** ({phone}): `{str(err)}`")
 
-                    # MODE B: SELECTED DMs ONLY
-                    elif target == "promo_custom_dm":
+                    # MODE B: SELECTED DMs ONLY OR BOTH (DM PORTION)
+                    if target in ["promo_custom_dm", "promo_both"]:
                         for dm_item in custom_dms:
                             try:
-                                target_user = int(dm_item) if dm_item.isdigit() else dm_item
+                                dm_clean = dm_item.strip()
+                                target_user = int(dm_clean) if (dm_clean.isdigit() or (dm_clean.startswith('-') and dm_clean[1:].isdigit())) else dm_clean
 
                                 if local_photo_path:
                                     await user_client.send_photo(target_user, photo=local_photo_path, caption=text)
@@ -714,8 +718,8 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                             except Exception as err:
                                 failed_reasons.append(f"• **{dm_item}** ({phone}): `{str(err)}`")
 
-                    # MODE C: ALL JOINED DIALOGS (GC / DM / BOTH)
-                    else:
+                    # MODE C: ALL JOINED DIALOGS (GC / DM)
+                    if target in ["promo_gc", "promo_dm"]:
                         async for dialog in user_client.get_dialogs():
                             chat = dialog.chat
                             chat_type = str(chat.type).lower()
@@ -729,8 +733,6 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                             if target == "promo_gc" and is_group_or_channel:
                                 should_send = True
                             elif target == "promo_dm" and is_private_dm:
-                                should_send = True
-                            elif target == "promo_both" and (is_group_or_channel or is_private_dm):
                                 should_send = True
 
                             if should_send:
