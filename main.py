@@ -1,6 +1,7 @@
 import os
 import re
 import asyncio
+import random
 import logging
 from io import BytesIO
 from pyrogram import Client, filters
@@ -637,7 +638,123 @@ async def ensure_group_joined(client: Client, gc_target: str) -> str:
                 raise join_err
 
 # ------------------------------------------------------------------
-# BROADCAST ENGINE WITH MATRIX COMBINATIONS & DETAILED FAILURE REASONS
+# SAFE SENDER HELPER (ANTI-BAN RANDOM DELAY INTEGRATED)
+# ------------------------------------------------------------------
+async def send_with_safety(client: Client, chat_id, text: str, local_photo_path: str = None):
+    # Dynamic Human Delay (Between 4 to 8 Seconds) to bypass Telegram AI Ban Filters
+    await asyncio.sleep(random.uniform(4.0, 8.0))
+    if local_photo_path:
+        await client.send_photo(chat_id, photo=local_photo_path, caption=text)
+    else:
+        await client.send_message(chat_id, text=text)
+
+# ------------------------------------------------------------------
+# INDIVIDUAL ACCOUNT WORKER (PARALLEL NON-BLOCKING TASK)
+# ------------------------------------------------------------------
+async def process_account_broadcast(phone: str, session_str: str, target: str, text: str, custom_gcs: list, custom_dms: list, local_photo_path: str):
+    user_client = Client(f"user_{phone}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+    sent_count = 0
+    failures = []
+
+    try:
+        await user_client.start()
+
+        # 1. SELECTED GROUPS PORTION
+        if target in ["promo_custom_gc", "combo_sel_gc_sel_dm", "combo_sel_gc_all_dm"]:
+            for gc_item in custom_gcs:
+                try:
+                    target_chat_id = await ensure_group_joined(user_client, gc_item)
+                    await send_with_safety(user_client, target_chat_id, text, local_photo_path)
+                    sent_count += 1
+                except SlowmodeWait as e:
+                    await asyncio.sleep(e.value)
+                    try:
+                        await send_with_safety(user_client, target_chat_id, text, local_photo_path)
+                        sent_count += 1
+                    except Exception as err:
+                        failures.append(f"• **{gc_item}** ({phone}): `{type(err).__name__}`")
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 2)
+                except ChatWriteForbidden:
+                    failures.append(f"• **{gc_item}** ({phone}): Permission Denied (Muted/Read-Only)")
+                except UserBannedInChannel:
+                    failures.append(f"• **{gc_item}** ({phone}): Account Banned in Group")
+                except PeerIdInvalid:
+                    failures.append(f"• **{gc_item}** ({phone}): Invalid Chat/Username")
+                except RPCError as err:
+                    failures.append(f"• **{gc_item}** ({phone}): `{err.MESSAGE or type(err).__name__}`")
+                except Exception as err:
+                    failures.append(f"• **{gc_item}** ({phone}): `{str(err)}`")
+
+        # 2. SELECTED DMs PORTION
+        if target in ["promo_custom_dm", "combo_sel_gc_sel_dm", "combo_all_gc_sel_dm"]:
+            for dm_item in custom_dms:
+                try:
+                    dm_clean = dm_item.strip()
+                    target_user = int(dm_clean) if (dm_clean.isdigit() or (dm_clean.startswith('-') and dm_clean[1:].isdigit())) else dm_clean
+                    await send_with_safety(user_client, target_user, text, local_photo_path)
+                    sent_count += 1
+                except FloodWait as e:
+                    await asyncio.sleep(e.value + 2)
+                except PeerIdInvalid:
+                    failures.append(f"• **{dm_item}** ({phone}): Invalid User/Username")
+                except RPCError as err:
+                    failures.append(f"• **{dm_item}** ({phone}): `{err.MESSAGE or type(err).__name__}`")
+                except Exception as err:
+                    failures.append(f"• **{dm_item}** ({phone}): `{str(err)}`")
+
+        # 3. DIALOG ITERATION PORTION (ALL GCs / ALL DMs)
+        if target in ["promo_gc", "promo_dm", "combo_sel_gc_all_dm", "combo_all_gc_sel_dm", "combo_all_gc_all_dm"]:
+            async for dialog in user_client.get_dialogs():
+                chat = dialog.chat
+                chat_type = str(chat.type).lower()
+                chat_name = chat.title or chat.first_name or f"ID: {chat.id}"
+                
+                is_group_or_channel = any(k in chat_type for k in ["group", "supergroup", "channel"])
+                is_private_dm = "private" in chat_type
+
+                should_send = False
+
+                if is_group_or_channel and target in ["promo_gc", "combo_all_gc_sel_dm", "combo_all_gc_all_dm"]:
+                    should_send = True
+
+                if is_private_dm and target in ["promo_dm", "combo_sel_gc_all_dm", "combo_all_gc_all_dm"]:
+                    should_send = True
+
+                if should_send:
+                    try:
+                        await send_with_safety(user_client, chat.id, text, local_photo_path)
+                        sent_count += 1
+                    except SlowmodeWait as e:
+                        await asyncio.sleep(e.value)
+                        try:
+                            await send_with_safety(user_client, chat.id, text, local_photo_path)
+                            sent_count += 1
+                        except Exception as err:
+                            failures.append(f"• **{chat_name}** ({phone}): `{type(err).__name__}`")
+                    except FloodWait as e:
+                        await asyncio.sleep(e.value + 2)
+                    except ChatWriteForbidden:
+                        failures.append(f"• **{chat_name}** ({phone}): Permission Denied")
+                    except UserBannedInChannel:
+                        failures.append(f"• **{chat_name}** ({phone}): Banned")
+                    except PeerIdInvalid:
+                        failures.append(f"• **{chat_name}** ({phone}): Invalid Chat/User")
+                    except RPCError as err:
+                        failures.append(f"• **{chat_name}** ({phone}): `{err.MESSAGE or type(err).__name__}`")
+                    except Exception as err:
+                        failures.append(f"• **{chat_name}** ({phone}): `{str(err)}`")
+
+        await user_client.stop()
+
+    except Exception as e:
+        logger.error(f"Execution error for account {phone}: {e}")
+        failures.append(f"• **Account {phone}**: Connection Error (`{type(e).__name__}`)")
+
+    return sent_count, failures
+
+# ------------------------------------------------------------------
+# MULTI-USER NON-BLOCKING BROADCAST ENGINE
 # ------------------------------------------------------------------
 async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_id: str = None, interval_minutes: int = 0):
     try:
@@ -645,8 +762,10 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
             my_accounts = user_sessions.get(owner_id, {})
             custom_gcs = user_custom_gcs.get(owner_id, [])
             custom_dms = user_custom_dms.get(owner_id, [])
-            total_sent = 0
-            failed_reasons = []
+            
+            if not my_accounts:
+                await bot.send_message(owner_id, "⚠️ **No accounts found to broadcast.**", reply_markup=main_menu_keyboard())
+                break
 
             local_photo_path = None
             if photo_file_id:
@@ -655,137 +774,28 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
                 except Exception as e:
                     logger.error(f"Failed to download media: {e}")
 
+            # Non-blocking async task array for each logged-in account
+            tasks = []
             for phone, session_str in my_accounts.items():
-                user_client = Client(f"user_{phone}", api_id=API_ID, api_hash=API_HASH, session_string=session_str)
+                task = asyncio.create_task(
+                    process_account_broadcast(
+                        phone, session_str, target, text, custom_gcs, custom_dms, local_photo_path
+                    )
+                )
+                tasks.append(task)
 
-                try:
-                    await user_client.start()
-
-                    # 1. SELECTED GROUPS PORTION
-                    if target in ["promo_custom_gc", "combo_sel_gc_sel_dm", "combo_sel_gc_all_dm"]:
-                        for gc_item in custom_gcs:
-                            try:
-                                target_chat_id = await ensure_group_joined(user_client, gc_item)
-
-                                if local_photo_path:
-                                    await user_client.send_photo(target_chat_id, photo=local_photo_path, caption=text)
-                                else:
-                                    await user_client.send_message(target_chat_id, text=text)
-
-                                total_sent += 1
-                                await asyncio.sleep(2)
-
-                            except SlowmodeWait as e:
-                                await asyncio.sleep(e.value)
-                                try:
-                                    if local_photo_path:
-                                        await user_client.send_photo(target_chat_id, photo=local_photo_path, caption=text)
-                                    else:
-                                        await user_client.send_message(target_chat_id, text=text)
-                                    total_sent += 1
-                                except Exception as err:
-                                    failed_reasons.append(f"• **{gc_item}** ({phone}): `{type(err).__name__}`")
-
-                            except FloodWait as e:
-                                await asyncio.sleep(e.value)
-                            except ChatWriteForbidden:
-                                failed_reasons.append(f"• **{gc_item}** ({phone}): Permission Denied (Muted/Read-Only)")
-                            except UserBannedInChannel:
-                                failed_reasons.append(f"• **{gc_item}** ({phone}): Account Banned in Group")
-                            except PeerIdInvalid:
-                                failed_reasons.append(f"• **{gc_item}** ({phone}): Invalid Chat/Username")
-                            except RPCError as err:
-                                failed_reasons.append(f"• **{gc_item}** ({phone}): `{err.MESSAGE or type(err).__name__}`")
-                            except Exception as err:
-                                failed_reasons.append(f"• **{gc_item}** ({phone}): `{str(err)}`")
-
-                    # 2. SELECTED DMs PORTION
-                    if target in ["promo_custom_dm", "combo_sel_gc_sel_dm", "combo_all_gc_sel_dm"]:
-                        for dm_item in custom_dms:
-                            try:
-                                dm_clean = dm_item.strip()
-                                target_user = int(dm_clean) if (dm_clean.isdigit() or (dm_clean.startswith('-') and dm_clean[1:].isdigit())) else dm_clean
-
-                                if local_photo_path:
-                                    await user_client.send_photo(target_user, photo=local_photo_path, caption=text)
-                                else:
-                                    await user_client.send_message(target_user, text=text)
-
-                                total_sent += 1
-                                await asyncio.sleep(2)
-
-                            except FloodWait as e:
-                                await asyncio.sleep(e.value)
-                            except PeerIdInvalid:
-                                failed_reasons.append(f"• **{dm_item}** ({phone}): Invalid User/Username")
-                            except RPCError as err:
-                                failed_reasons.append(f"• **{dm_item}** ({phone}): `{err.MESSAGE or type(err).__name__}`")
-                            except Exception as err:
-                                failed_reasons.append(f"• **{dm_item}** ({phone}): `{str(err)}`")
-
-                    # 3. DIALOG ITERATION PORTION (ALL GCs / ALL DMs)
-                    if target in ["promo_gc", "promo_dm", "combo_sel_gc_all_dm", "combo_all_gc_sel_dm", "combo_all_gc_all_dm"]:
-                        async for dialog in user_client.get_dialogs():
-                            chat = dialog.chat
-                            chat_type = str(chat.type).lower()
-                            chat_name = chat.title or chat.first_name or f"ID: {chat.id}"
-                            
-                            is_group_or_channel = any(k in chat_type for k in ["group", "supergroup", "channel"])
-                            is_private_dm = "private" in chat_type
-
-                            should_send = False
-
-                            # Group filtering
-                            if is_group_or_channel and target in ["promo_gc", "combo_all_gc_sel_dm", "combo_all_gc_all_dm"]:
-                                should_send = True
-
-                            # DM filtering
-                            if is_private_dm and target in ["promo_dm", "combo_sel_gc_all_dm", "combo_all_gc_all_dm"]:
-                                should_send = True
-
-                            if should_send:
-                                try:
-                                    if local_photo_path:
-                                        await user_client.send_photo(chat.id, photo=local_photo_path, caption=text)
-                                    else:
-                                        await user_client.send_message(chat.id, text=text)
-                                    
-                                    total_sent += 1
-                                    await asyncio.sleep(2)
-                                
-                                except SlowmodeWait as e:
-                                    await asyncio.sleep(e.value)
-                                    try:
-                                        if local_photo_path:
-                                            await user_client.send_photo(chat.id, photo=local_photo_path, caption=text)
-                                        else:
-                                            await user_client.send_message(chat.id, text=text)
-                                        total_sent += 1
-                                    except Exception as err:
-                                        failed_reasons.append(f"• **{chat_name}** ({phone}): `{type(err).__name__}`")
-                                
-                                except FloodWait as e:
-                                    await asyncio.sleep(e.value)
-                                
-                                except ChatWriteForbidden:
-                                    failed_reasons.append(f"• **{chat_name}** ({phone}): Permission Denied")
-                                except UserBannedInChannel:
-                                    failed_reasons.append(f"• **{chat_name}** ({phone}): Banned")
-                                except PeerIdInvalid:
-                                    failed_reasons.append(f"• **{chat_name}** ({phone}): Invalid Chat/User")
-                                except RPCError as err:
-                                    failed_reasons.append(f"• **{chat_name}** ({phone}): `{err.MESSAGE or type(err).__name__}`")
-                                except Exception as err:
-                                    failed_reasons.append(f"• **{chat_name}** ({phone}): `{str(err)}`")
-
-                    await user_client.stop()
-
-                except Exception as e:
-                    logger.error(f"Execution error for account {phone}: {e}")
-                    failed_reasons.append(f"• **Account {phone}**: Login/Connection Failed (`{type(e).__name__}`)")
+            # Wait for all account broadcasts to execute in parallel
+            results = await asyncio.gather(*tasks)
 
             if local_photo_path and os.path.exists(local_photo_path):
                 os.remove(local_photo_path)
+
+            total_sent = 0
+            failed_reasons = []
+
+            for sent_cnt, fails in results:
+                total_sent += sent_cnt
+                failed_reasons.extend(fails)
 
             summary_msg = (
                 f"📊 **Broadcast Completed Round Summary**\n\n"
@@ -811,6 +821,10 @@ async def run_user_broadcast(owner_id: int, target: str, text: str, photo_file_i
 
     except asyncio.CancelledError:
         logger.info(f"Broadcast loop stopped for user {owner_id}")
+    except Exception as main_err:
+        logger.error(f"Main Broadcast loop error: {main_err}")
+    finally:
+        active_loops.pop(owner_id, None)
 
 # ------------------------------------------------------------------
 # ENTRY POINT
